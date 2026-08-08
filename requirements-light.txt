@@ -1,0 +1,8 @@
+# Variante sin Marker: no arrastra torch ni los ~2-4GB de pesos del modelo.
+# Sirve para PDFs nativos con layout simple, docx y pptx. Sin OCR real.
+# Usar con: docker build --build-arg WITH_MARKER=false
+pymupdf4llm==1.28.2
+pymupdf==1.28.2
+python-pptx==1.0.2
+anthropic==0.121.0
+python-dotenv==1.2.2

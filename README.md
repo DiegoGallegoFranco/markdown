@@ -1,204 +1,342 @@
 # pdf-a-md
 
 Pipeline para convertir PDFs (y docx/pptx) a Markdown limpio, con imágenes
-extraídas y enlazadas con rutas relativas. Pensado para correr con Claude
-Code u otro agente con acceso a bash, sobre una carpeta de documentos propia
-del usuario (que **no** vive en este repo — ver `.gitignore`).
+extraídas y enlazadas con rutas relativas. Se usa de dos formas:
+
+- **CLI** — `python -m pipeline ...` sobre una carpeta de documentos propia
+  (que **no** vive en este repo; ver `.gitignore`).
+- **Web** — subir documentos por el navegador y descargar el Markdown en un ZIP.
+  Pensada para desplegarse en un servidor (ver [Docker](#despliegue-con-docker)).
 
 Dos motores para PDF, con trade-offs distintos:
 
 - **`pymupdf4llm`**: rápido, sin GPU, sin dependencias pesadas. Buen resultado
   en PDFs de una columna con tablas simples. Falla en layouts multicolumna
-  complejos: mezcla el texto de columnas paralelas en un solo párrafo.
-- **`Marker`** (Datalab, modo `--mode balanced`): usa un modelo de layout +
-  OCR completo vía VLM. Resuelve correctamente multicolumna y genera mejor
-  jerarquía de encabezados en documentos densos (manuales, doctrina, informes
-  largos). Mucho más lento (~5-30 s/página según complejidad de tablas, vs.
-  segundos para el documento completo con pymupdf4llm) y requiere más setup.
+  complejos: mezcla el texto de columnas paralelas en un solo párrafo. **No hace
+  OCR**: sobre un PDF escaneado devuelve un documento vacío.
+- **`Marker`** (Datalab): el único de los dos que hace **OCR real**. Resuelve
+  multicolumna y genera mejor jerarquía de encabezados en documentos densos
+  (manuales, doctrina, informes largos). Mucho más lento y con más setup.
 
-Regla práctica: probar primero con `pymupdf4llm` en una muestra; si el
-documento tiene multicolumna o la jerarquía de encabezados sale mal, usar
-Marker para ese subconjunto.
+  Marker tiene dos modos y **elige solo según el dispositivo**:
 
-## Setup
+  | Modo | Qué hace | Dónde corre |
+  |---|---|---|
+  | `fast` | Detectores CPU ligeros para layout/tablas; OCR solo de bloques ilegibles | Default en **CPU/MPS** |
+  | `balanced` | Modelo de layout VLM + OCR de página completa; mejor calidad | Default en **GPU**. Requiere el binario `llama-server` |
+
+  Esto importa para la decisión de hardware: en un servidor **sin GPU no solo
+  vas más lento, corres un modo distinto y de menor calidad**.
+
+El **modo `auto`** (por defecto) hace la elección por documento: clasifica cada
+PDF con el inventario y manda a Marker solo los escaneados. Es lo que conviene
+en casi todos los casos.
+
+## Arquitectura
+
+```
+pipeline/          núcleo: rutas, inventario, conversores, captions, QC
+  paths.py         resolución de rutas de entrada/salida
+  inventory.py     fase 1 — clasificar nativo vs escaneado
+  converters.py    pymupdf4llm / Marker / pandoc / python-pptx
+  captions.py      descripción de imágenes con la API de Claude (reanudable)
+  qc.py            fase 4 — validación e inventario final
+  cli.py           CLI unificada (python -m pipeline)
+webapp/            interfaz web (FastAPI) + cola de trabajos (SQLite)
+patches/           parches a bugs upstream de marker-pdf y surya-ocr
+*.py, *.sh         wrappers de compatibilidad de los comandos originales
+```
+
+La CLI y la web comparten exactamente el mismo código de conversión; no hay dos
+implementaciones que puedan desincronizarse.
+
+## Setup local
+
+Requiere **Python 3.10+** (marker-pdf y FastAPI no soportan 3.9; el `python3`
+del sistema en macOS suele ser 3.9 — usar `brew install python@3.12`).
 
 ```bash
-python -m venv .venv
+python3.12 -m venv .venv
 source .venv/bin/activate
-pip install -r requirements.txt
+pip install -r requirements.txt        # núcleo (incluye Marker)
+pip install -r requirements-web.txt    # solo si vas a usar la interfaz web
 
-# Solo si vas a usar Marker en Mac sin GPU NVIDIA (usa Metal/Apple Silicon
-# automáticamente vía llama-server, sin configuración adicional):
+# Alternativa sin Marker (sin torch, sin OCR — mucho más liviana):
+# pip install -r requirements-light.txt
+
+# Necesario para el modo `balanced` de Marker (el de mayor calidad), en
+# cualquier plataforma — no solo en Mac:
 brew install llama.cpp
 
 # Solo si vas a convertir .docx:
 brew install pandoc
 
 # Aplicar SIEMPRE después de instalar/actualizar marker-pdf, antes de usar
-# --mode balanced (ver detalle de los bugs en patches/*.py):
+# --mode balanced (ver detalle de los bugs en patches/*.py). Ahora SALEN CON
+# ERROR si el patrón esperado no está — no fallan en silencio:
 python patches/fix_surya_grammar.py
 python patches/fix_marker_empty_image.py
 ```
 
-## Fase 0 — Entorno
+> **Las versiones de `requirements.txt` están pineadas a propósito.** Los parches
+> reescriben líneas literales de `marker-pdf 2.0.0` y `surya-ocr 0.22.1`. Al
+> subir cualquiera de las dos, revisar `patches/` **antes** de desplegar.
 
-- Lanzar la sesión con acceso a la carpeta de documentos (ej. `claude --add-dir /ruta/a/documentos`).
-- Verificar salida a internet para instalar paquetes de PyPI/Homebrew y (si se usa Marker) descargar los pesos del modelo (~2-4GB la primera vez).
-
-## Fase 1 — Inventario y diagnóstico
-
-```bash
-python inventario.py /ruta/a/documentos
-```
-
-Genera `inventario.csv` (ruta, páginas, tipo nativo/escaneado, imágenes
-embebidas, tamaño) clasificando cada PDF por proporción de páginas con texto
-seleccionable vs. imagen. Los "escaneados" (ratio_texto bajo) necesitan OCR
-real — Marker con `--mode balanced` lo hace; pymupdf4llm no.
-
-## Fase 2 — Piloto (validación de calidad)
-
-Convertir 3-5 PDFs representativos (uno simple, uno con tablas, uno con
-muchas imágenes, uno con layout complejo si aplica) y revisar antes de
-lanzar el lote completo:
+## Uso por CLI
 
 ```bash
-python convertir_pymupdf.py "carpeta/doc1.pdf" "carpeta/doc2.pdf"
+# Fase 1 — inventario y diagnóstico
+python -m pipeline inventario /ruta/a/documentos
+
+# Fase 2 — piloto sobre unos pocos documentos representativos
+python -m pipeline convertir "/ruta/doc1.pdf" "/ruta/doc2.pdf" --engine auto
+
+# Fase 3 — lote completo (acepta archivos o directorios, rutas absolutas)
+python -m pipeline convertir /ruta/a/documentos --engine auto --skip-existing
+
+# Descripción de imágenes (opcional, requiere ANTHROPIC_API_KEY)
+python -m pipeline captions --dry-run     # cuenta, no llama a la API
+python -m pipeline captions --limit 3     # smoke test
+python -m pipeline captions               # todo
+
+# Fase 4 — control de calidad
+python -m pipeline qc
+
+# Todo de una
+python -m pipeline todo /ruta/a/documentos --engine auto --captions
 ```
 
-Punto de control: comparar contra el PDF original — jerarquía de
-encabezados, legibilidad de tablas, enlaces de imágenes. Si un documento
-tiene multicolumna mal resuelto, probar el mismo documento con Marker:
+Los scripts originales siguen funcionando como wrappers: `inventario.py`,
+`convertir_pymupdf.py`, `convertir_marker.sh`, `convertir_docx.sh`,
+`convertir_pptx.py`, `caption_imagenes.py`, `audit_dedup_captions.py`,
+`qc_inventario.py`.
+
+### Salida
+
+Todo queda en `output/<estructura de carpetas saneada>/<documento>/`, con
+imágenes en `assets/` (o `media/` para pandoc; Marker las deja planas junto al
+`.md`) y enlaces relativos al propio `.md` — la carpeta de cada documento es
+autocontenida y portable.
+
+La estructura relativa se calcula contra el **ancestro común del lote**. Si
+mezclas documentos de árboles muy distintos (p. ej. `/Users/...` y `/mnt/...`),
+el ancestro común es `/` y las rutas de salida salen profundas; usa
+`--input-root /ruta/base` para fijarla explícitamente.
+
+### Flags útiles
+
+| Flag | Para qué |
+|---|---|
+| `--engine auto\|pymupdf\|marker` | Motor de PDF; `auto` decide por documento |
+| `--skip-existing` | No reconvertir lo que ya tiene un `.md` no vacío — reanuda un lote interrumpido |
+| `--out DIR` | Directorio de salida (default `output`) |
+| `--input-root DIR` | Raíz para las rutas relativas de salida |
+
+## Interfaz web
 
 ```bash
-./convertir_marker.sh "carpeta/doc_problema.pdf"
+pip install -r requirements-web.txt
+uvicorn webapp.main:app --host 0.0.0.0 --port 8000
 ```
 
-## Fase 3 — Conversión por lotes
+Abrir `http://localhost:8000`. Permite subir varios documentos a la vez, elegir
+motor, activar el captioning, seguir el progreso en vivo y descargar el
+resultado como ZIP. Los trabajos se procesan en una cola en segundo plano y
+sobreviven a un reinicio del servicio (se reanudan donde estaban).
 
-Con la(s) herramienta(s) ganadora(s) decidida(s) por subconjunto de
-documentos:
+| Variable | Default | Para qué |
+|---|---|---|
+| `DATA_DIR` | `data` | Dónde viven subidas, resultados y la base de trabajos |
+| `WORKERS` | `1` | Trabajos simultáneos. Con Marker dejar en 1: uno ya satura la máquina |
+| `ANTHROPIC_API_KEY` | — | Habilita el paso opcional de captioning |
+| `MAX_UPLOAD_MB` | `500` | Tope por archivo |
+| `RETENTION_DAYS` | `14` | Borra trabajos terminados más antiguos (0 = nunca) |
+| `MARKER_MODE` | *(vacío)* | Vacío = Marker elige por dispositivo. `fast` o `balanced` para forzarlo |
+| `MARKER_TIMEOUT_S` | `14400` | Corta un documento colgado en vez de bloquear el lote |
+
+> **La app no tiene autenticación.** Cualquiera que alcance el puerto puede
+> subir documentos, ver los de los demás y borrarlos. Por eso el
+> `docker-compose.yml` la publica solo en `127.0.0.1`. Para exponerla en la red
+> o a internet, poner delante un proxy inverso que resuelva el acceso
+> (nginx/Caddy con autenticación y TLS, o una VPN) — no basta con abrir el
+> puerto.
+
+## Despliegue con Docker
 
 ```bash
-python convertir_pymupdf.py archivo1.pdf archivo2.pdf ...
-./convertir_marker.sh archivo3.pdf archivo4.pdf ...
-./convertir_docx.sh archivo.docx ...
-python convertir_pptx.py archivo.pptx ...
+# Imagen completa (con Marker/OCR). Tarda: arrastra torch + CUDA (~9.7 GB
+# de imagen final, medido en arm64).
+docker compose up -d --build
+
+# Imagen ligera, sin Marker ni torch (~1.3 GB): PDFs nativos, docx y pptx.
+# Sin OCR: un PDF escaneado sale vacío.
+docker build --build-arg WITH_MARKER=false -t doc2md-light .
 ```
 
-Todo queda en `output/<misma estructura de carpetas>/<documento>/`, con
-imágenes en `assets/` (o `media/` para docx, por defecto de pandoc; Marker
-las deja planas en la misma carpeta que el `.md`) y enlaces relativos al
-propio `.md` — la carpeta de cada documento es autocontenida y portable.
+Configuración por `.env` junto al `docker-compose.yml`:
 
-`convertir_marker.sh` escribe además `marker_batch.log` con timestamps,
-duración y éxito/error por documento, y aplana automáticamente la
-subcarpeta redundante que crea `marker_single` (ver Problemas conocidos).
+```env
+PORT=8000
+WORKERS=1
+# ANTHROPIC_API_KEY=sk-ant-...   # solo si quieres captioning de imágenes
+```
 
-Si un documento falla a mitad de lote (ver Problemas conocidos — el bug de
-imagen vacía es el caso típico), el resto del lote sigue: `convertir_marker.sh`
-no se detiene en un `ERROR`, solo lo deja registrado en el log. Reintentar
-ese documento suelto después con el mismo comando.
+El servicio se publica en `127.0.0.1:8000` del host. Para llegar desde otra
+máquina, ponle delante un proxy inverso (que además es donde toca resolver
+autenticación y TLS) en vez de abrir el puerto directamente.
 
-## Fase 4 — Control de calidad y cierre
+Todo el estado (subidas, resultados, base de trabajos y **la caché de pesos del
+modelo**) vive en el volumen `doc2md-data` montado en `/data`. El contenedor es
+desechable; el volumen no. Sin ese volumen, Marker vuelve a descargar 2-4 GB de
+pesos en cada recreación.
+
+### GPU NVIDIA
+
+Los wheels de torch que instala `marker-pdf` en linux/amd64 ya traen CUDA, así
+que **la misma imagen sirve para CPU y GPU** — lo que cambia es el runtime:
 
 ```bash
-python qc_inventario.py
+docker compose -f docker-compose.yml -f docker-compose.gpu.yml up -d
+
+# Verificar que el contenedor ve la GPU:
+docker compose exec app python -c "import torch; print(torch.cuda.is_available())"
 ```
 
-Recorre `output/`, valida cada `.md` (vacío, sin encabezados, enlaces de
-imagen rotos) y genera `inventario_final.csv` con el resultado por
-documento — cruza duración desde `marker_batch.log` si existe. Un `.md` con
-0 encabezados en un documento largo, o con imágenes referenciadas que no
-existen, es señal de que ese documento necesita revisión manual (no
-necesariamente un error del pipeline: puede ser que el docx original no use
-estilos de encabezado, por ejemplo).
+Requiere el NVIDIA Container Toolkit en el host.
+
+**Para aprovechar la GPU de verdad hace falta el modo `balanced`**, y ese modo
+necesita el binario `llama-server`, que la imagen por defecto no trae:
+
+```bash
+docker build --build-arg WITH_MARKER=true --build-arg WITH_LLAMA_SERVER=true -t doc2md .
+```
+
+Compila llama.cpp en una etapa aparte (solo el binario llega a la imagen
+final). Sin él, Marker corre en modo `fast` incluso con GPU presente, y forzar
+`MARKER_MODE=balanced` falla con `llama-server binary not found`.
+
+### CLI dentro del contenedor
+
+```bash
+docker compose run --rm app cli inventario /data/entrada
+docker compose run --rm app cli convertir /data/entrada --engine auto --out /data/salida
+```
+
+## ¿Este equipo o un servidor con GPU?
+
+Solo una etapa del pipeline es pesada, así que la decisión depende de cuántas
+páginas caen en la ruta Marker — no de cuántos documentos hay:
+
+| Etapa | Recurso | ¿Gana con GPU NVIDIA? |
+|---|---|---|
+| inventario / QC | CPU, I/O | No |
+| pymupdf4llm, pandoc, pptx | CPU | No — segundos por documento |
+| **Marker `--mode balanced`** | **VLM** | **Sí, mucho** |
+| captioning | red / API de Claude | No — es latencia de red |
+
+Con ~15 s/página de media en Apple Silicon (Metal), un MacBook Pro M3 Pro hace
+~240 páginas/hora en Marker:
+
+- **< 2.000 páginas Marker** → local, de noche. No hace falta servidor.
+- **2.000–10.000** → local es viable en un fin de semana; una GPU rentada se
+  paga sola en horas ahorradas.
+- **> 10.000, o proceso recurrente** → servidor. En una L4/A10/4090 el camino
+  torch hace batching real, que en Apple Silicon vía `llama-server` no existe
+  (es un solo stream): entre 5x y 15x.
+
+A la velocidad se suma la calidad: en CPU, Marker corre en modo `fast`
+(detectores ligeros); el modo `balanced` — layout VLM + OCR de página completa,
+que es lo que resuelve bien la multicolumna — es el default *en GPU*. Un
+servidor con GPU no solo termina antes: produce mejor Markdown.
+
+**Corre `python -m pipeline inventario` sobre el corpus real antes de decidir.**
+Si sale mayormente `nativo`, todo esto es discutir sobre nada: pymupdf4llm lo
+resuelve en minutos en cualquier portátil.
+
+**Y antes de la velocidad, mira la sensibilidad de los documentos.** Si no
+pueden salir de la organización, eso descarta tanto la GPU rentada en la nube
+como el captioning vía API — y entonces "esperar toda la noche en el portátil"
+es la opción correcta, no la lenta.
+
+Nota de memoria: 18 GB unificados bastan para un stream de Marker (pesos 2-4 GB
++ torch + llama-server), pero van justos con Docker, IDEs y navegador abiertos.
+La presión de memoria manda a swap y la degradación es brutal — cierra lo demás
+antes de un lote largo.
 
 ## Problemas conocidos
 
-- **pymupdf4llm 1.28.x**: al usar `write_images=True`, si la ruta de salida
-  tiene espacios o paréntesis, el guardado de imágenes falla
-  (`code=2: cannot open file`) por una inconsistencia interna entre la ruta
-  saneada para el enlace Markdown y la ruta real usada para `pix.save()`.
-  Workaround ya aplicado en `convertir_pymupdf.py`: sanear los nombres de
-  carpeta propios antes de pasarlos a la librería.
+- **pymupdf4llm 1.28.x**: con `write_images=True`, si la ruta de salida tiene
+  espacios o paréntesis, el guardado de imágenes falla (`code=2: cannot open
+  file`) por una inconsistencia entre la ruta saneada para el enlace Markdown y
+  la real usada en `pix.save()`. Workaround aplicado en `pipeline/paths.py`
+  (`slugify`): se sanean los nombres antes de pasarlos a la librería.
 - **surya-ocr 0.22.x** (dependencia de marker-pdf, modo `balanced`): bug de
   gramática GBNF con `\d` que rompe el layout inference en Mac/CPU/MPS. Ver
+  [datalab-to/surya#542](https://github.com/datalab-to/surya/issues/542) y
   `patches/fix_surya_grammar.py`.
 - **marker-pdf 2.0.0**: si una caja de layout se recorta a área cero (bbox
   degenerado), Pillow revienta con `ValueError: cannot write empty image as
   JPEG` y aborta la conversión COMPLETA del documento, aunque llevara 20+
-  minutos procesado — sin workaround por CLI. Ver
-  `patches/fix_marker_empty_image.py` (salta esa imagen puntual con un
-  aviso en vez de abortar). Sin issue/fix upstream conocido a la fecha.
-- **`marker_single` anida su propio output**: crea `--output_dir/<nombre
-  original del archivo>/<archivo>.md` en vez de `--output_dir/<archivo>.md`
-  directamente — un nivel de más, y con el nombre *sin sanear* (con
-  espacios/paréntesis) aunque `--output_dir` sí esté saneado. `convertir_marker.sh`
-  ya lo aplana automáticamente después de cada conversión exitosa.
+  minutos. Ver `patches/fix_marker_empty_image.py` (salta esa imagen puntual
+  con un aviso en vez de abortar). Sin fix upstream conocido a la fecha.
+- **`marker_single` anida su propio output**: crea
+  `--output_dir/<nombre original>/<archivo>.md` en vez de
+  `--output_dir/<archivo>.md`, y con el nombre *sin sanear*.
+  `pipeline/converters.py` lo aplana automáticamente.
 - **Multicolumna**: incluso con Marker, revisar manualmente documentos con
-  layouts muy irregulares (outlines multinivel, tablas anidadas) — es el
-  punto débil común a ambas herramientas.
+  layouts muy irregulares (outlines multinivel, tablas anidadas) — es el punto
+  débil común a ambas herramientas.
+- **PPTX con `.emf`/`.wmf`**: esos formatos (típicos de diagramas pegados desde
+  Office) se extraen igual, pero se enlazan como adjunto y no como imagen —
+  ningún visor de Markdown los renderiza.
 
-## Procesamiento de imágenes: recomendaciones
+## Procesamiento de imágenes
 
 Las imágenes se extraen como archivos separados con enlaces relativos
-(`assets/imagen.png`), nunca embebidas en base64 dentro del `.md`. Motivos,
-confirmados contra prácticas actuales de RAG/pipelines multimodales:
+(`assets/imagen.png`), nunca embebidas en base64 dentro del `.md`. Motivos:
 
 - **Base64 inline infla el archivo ~33%** y vuelve los diffs de git
-  ilegibles/gigantes — malo para versionado y para indexar en un pipeline de
-  RAG (los chunks de texto quedan contaminados con blobs enormes).
-- **El costo en tokens de un modelo de visión (incluido Claude) depende de
-  la RESOLUCIÓN de la imagen, no de si se manda como base64 o como
-  archivo/URL.** Claude tokeniza en parches de 28×28px: una imagen de
-  1000×1000px cuesta ~1,334 tokens sin importar el encoding. Es decir,
-  convertir a base64 no ahorra ni cuesta tokens — es puramente un formato de
-  transporte.
-- Por lo tanto, **el archivo separado es estrictamente mejor para
-  almacenamiento/versionado**, y la conversión a base64 (si hace falta,
-  porque cierta API solo acepta eso) es una responsabilidad del consumidor
-  en el momento de la llamada — no algo que decidir en el momento de la
-  conversión PDF→MD.
+  ilegibles — malo para versionado y para indexar en un pipeline de RAG (los
+  chunks de texto quedan contaminados con blobs enormes).
+- **El costo en tokens de un modelo de visión depende de la RESOLUCIÓN de la
+  imagen, no del encoding.** Claude tokeniza en parches: una imagen de
+  1000×1000px cuesta lo mismo venga como base64 o como archivo. Base64 no ahorra
+  ni cuesta tokens — es puramente un formato de transporte.
+- Por lo tanto **el archivo separado es estrictamente mejor para
+  almacenamiento/versionado**, y convertir a base64 (si cierta API solo acepta
+  eso) es responsabilidad del consumidor en el momento de la llamada.
 
-### Captioning de imágenes (implementado)
+### Captioning de imágenes
 
-Para que el contenido de diagramas/mapas/tablas-como-imagen sea *buscable
-por texto* (un RAG de solo texto no puede "ver" una imagen), se genera una
-vez, en un paso posterior a la conversión, una descripción corta de cada
-imagen vía un modelo con visión, y se inserta como texto justo debajo de la
-imagen en el `.md`:
+Para que el contenido de diagramas/mapas/tablas-como-imagen sea *buscable por
+texto* (un RAG de solo texto no puede "ver" una imagen), se genera una vez una
+descripción corta de cada imagen y se inserta justo debajo:
 
 ```bash
-python caption_imagenes.py --limit 3   # smoke test primero
-python caption_imagenes.py             # todo output/
-python audit_dedup_captions.py --audit # verificar que cuadre 1 caption/imagen
+python -m pipeline captions --limit 3    # smoke test
+python -m pipeline captions              # todo
+python -m pipeline captions-audit        # verificar 1 caption por imagen
 ```
 
-- Usa la API de Claude en paralelo (`MAX_WORKERS = 10` en el script) —
-  rápido (minutos, no horas) y barato (~$1-1.50 para varios cientos de
-  imágenes con Sonnet). Requiere `ANTHROPIC_API_KEY`.
+- **Es reanudable**: las imágenes que ya tienen caption se detectan y se saltan
+  sin llamar a la API. Reejecutar tras un fallo a mitad de lote no repaga nada
+  ni duplica descripciones. (`captions-dedup` sigue disponible para limpiar
+  duplicados heredados de corridas anteriores.)
+- Rápido y barato: minutos y ~$1-2 para varios cientos de imágenes. Requiere
+  `ANTHROPIC_API_KEY`. Modelo configurable con `CAPTION_MODEL` (default
+  `claude-sonnet-5`; `claude-haiku-4-5` sale más barato).
 - **Alternativa 100% local** (sin costo, sin que las imágenes salgan de la
-  máquina — preferible si los documentos son sensibles): un modelo de
-  visión pequeño vía `llama.cpp`/GGUF (ya instalado si se usó Marker). En
-  2026, buenas opciones para Apple Silicon: `Qwen3-VL-4B` (mejor
-  calidad/tamaño) o `MiniCPM-V 4.6` (0.8B, el más rápido). No incluido como
-  script en este repo todavía — reusar el mismo patrón de
-  `llama-server` que usa Marker (ver `patches/`), cambiando el modelo GGUF.
-- **Cuidado con la concurrencia**: si varios hilos escriben el mismo `.md`
-  en paralelo sin lock, hay *lost updates* (captions que desaparecen sin
-  error visible). `caption_imagenes.py` ya usa un lock por archivo — no
-  quitarlo si se modifica el script.
-- Si el conteo final de captions no coincide exactamente con el de
-  imágenes, correr `audit_dedup_captions.py --dedup` (duplicados) y
-  `--audit` (faltantes). Una causa posible de faltantes que **no** es un
-  bug de este script: Marker a veces duplica una página completa, dejando
-  el mismo nombre de imagen referenciado dos veces en el mismo documento —
-  la segunda aparición es contenido redundante, no información perdida.
+  máquina — preferible si los documentos son sensibles): un modelo de visión
+  pequeño vía `llama.cpp`/GGUF (ya instalado si se usó Marker). Buenas opciones
+  para Apple Silicon: `Qwen3-VL-4B` o `MiniCPM-V 4.6`. No incluido como script
+  todavía: reusar el mismo patrón de `llama-server` que usa Marker, cambiando el
+  modelo GGUF.
+- **Cuidado con la concurrencia**: si varios hilos escriben el mismo `.md` sin
+  lock hay *lost updates* (captions que desaparecen sin error visible).
+  `pipeline/captions.py` usa un lock por archivo — no quitarlo.
 
 Sources:
 - [markitdown issue #2049 — extraer imágenes como archivos separados](https://github.com/microsoft/markitdown/issues/2049)
 - [Building a Multimodal LLM Application with PyMuPDF4LLM](https://artifex.com/blog/building-a-multimodal-llm-application-with-pymupdf4llm)
 - [Claude Vision docs — cálculo de tokens por imagen](https://platform.claude.com/docs/en/build-with-claude/vision)
 - [Multimodal RAG: Retrieving from Images, PDFs, and Tables](https://tensoria.fr/en/blog/multimodal-rag-images-pdfs-tables)
-- [Multimodality RAG (MRAG)](https://medium.com/@shivamarora1/multimodality-rag-mrag-extract-store-and-retrieve-visual-data-diagrams-images-from-document-dd47b1892dc8)

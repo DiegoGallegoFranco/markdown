@@ -1,0 +1,70 @@
+{% extends "base.html" %}
+{% block title %}Trabajo {{ job.id }}{% endblock %}
+{% block content %}
+
+<p class="muted"><a href="/">← Todos los trabajos</a></p>
+
+<div class="panel">
+  <h2 style="margin-top:0">Trabajo <code>{{ job.id }}</code>
+    <span class="badge {{ job.status }}" id="estado">{{ job.status }}</span></h2>
+  <p class="muted" id="paso">
+    Motor: {{ job.engine }} · Captions: {{ "sí" if job.captions else "no" }} ·
+    {{ job.n_done }}/{{ job.n_files }} documentos
+    {% if job.step %}· paso actual: {{ job.step }}{% endif %}
+  </p>
+
+  {% if job.error %}<p class="nota" style="color:var(--err)">{{ job.error }}</p>{% endif %}
+
+  {% if job.summary %}
+  <div class="grid" style="margin:1rem 0">
+    <div class="stat"><b>{{ job.summary.ok }}</b><span>documentos OK</span></div>
+    <div class="stat"><b>{{ job.summary.revision }}</b><span>a revisar</span></div>
+    <div class="stat"><b>{{ job.summary.fallidos }}</b><span>fallidos</span></div>
+    <div class="stat"><b>{{ job.summary.imagenes }}</b><span>imágenes</span></div>
+    <div class="stat"><b>{{ job.summary.captions }}</b><span>captions</span></div>
+  </div>
+  {% if job.summary.errores %}
+  <p class="nota">
+    Documentos que fallaron:
+    {% for e in job.summary.errores %}<br><code>{{ e.documento }}</code> — {{ e.error }}{% endfor %}
+  </p>
+  {% endif %}
+  {% endif %}
+
+  {% if job.status == "done" %}
+    <a class="btn" href="/jobs/{{ job.id }}/download">Descargar ZIP</a>
+  {% endif %}
+  <a class="btn btn-ghost" href="/jobs/{{ job.id }}/log">Log completo</a>
+  <form method="post" action="/jobs/{{ job.id }}/delete" style="display:inline"
+        onsubmit="return confirm('Esto borra los documentos subidos y el resultado. ¿Continuar?')">
+    <button type="submit" class="btn btn-ghost">Borrar</button>
+  </form>
+</div>
+
+<h2>Registro</h2>
+<pre class="log" id="log">{{ log }}</pre>
+
+<script>
+  const terminado = {{ "true" if job.status in ["done", "error"] else "false" }};
+  const logEl = document.getElementById("log");
+  logEl.scrollTop = logEl.scrollHeight;
+
+  if (!terminado) {
+    // Se sondea el estado en vez de recargar: así el log no pierde la posición
+    // de scroll mientras el trabajo avanza.
+    setInterval(async () => {
+      const r = await fetch("/api/jobs/{{ job.id }}");
+      if (!r.ok) return;
+      const j = await r.json();
+      const pegado = logEl.scrollHeight - logEl.scrollTop - logEl.clientHeight < 40;
+      logEl.textContent = j.log;
+      if (pegado) logEl.scrollTop = logEl.scrollHeight;
+      document.getElementById("estado").textContent = j.status;
+      document.getElementById("paso").textContent =
+        `Motor: ${j.engine} · ${j.n_done}/${j.n_files} documentos` +
+        (j.step ? ` · paso actual: ${j.step}` : "");
+      if (j.status === "done" || j.status === "error") location.reload();
+    }, 3000);
+  }
+</script>
+{% endblock %}

@@ -1,0 +1,40 @@
+# Despliegue por defecto: CPU. Para GPU NVIDIA:
+#   docker compose -f docker-compose.yml -f docker-compose.gpu.yml up -d
+services:
+  app:
+    build:
+      context: .
+      args:
+        WITH_MARKER: "${WITH_MARKER:-true}"   # "false" para la imagen ligera sin OCR
+        # "true" compila llama-server: necesario para el modo `balanced` de
+        # Marker, que es el que usa la GPU y da la mejor calidad.
+        WITH_LLAMA_SERVER: "${WITH_LLAMA_SERVER:-false}"
+    image: doc2md:latest
+    restart: unless-stopped
+    # La app no tiene autenticación: se publica solo en la interfaz de loopback
+    # del host. Para exponerla en la red, cambiar a "${PORT:-8000}:8000" y poner
+    # delante un proxy inverso que resuelva el acceso.
+    ports:
+      - "127.0.0.1:${PORT:-8000}:8000"
+    environment:
+      # Trabajos simultáneos. Con Marker dejar en 1: un solo documento ya
+      # satura la GPU/CPU y dos en paralelo solo se estorban.
+      WORKERS: "${WORKERS:-1}"
+      # Vacío = marker elige por dispositivo (fast en CPU, balanced en GPU).
+      # "balanced" a mano requiere el binario llama-server en la imagen.
+      MARKER_MODE: "${MARKER_MODE:-}"
+      MARKER_TIMEOUT_S: "${MARKER_TIMEOUT_S:-14400}"
+      MAX_UPLOAD_MB: "${MAX_UPLOAD_MB:-500}"
+      RETENTION_DAYS: "${RETENTION_DAYS:-14}"
+      # Opcional: habilita el captioning de imágenes. Si los documentos son
+      # sensibles, dejarla vacía — las imágenes saldrían de la máquina.
+      ANTHROPIC_API_KEY: "${ANTHROPIC_API_KEY:-}"
+      CAPTION_MODEL: "${CAPTION_MODEL:-claude-sonnet-5}"
+      CAPTION_WORKERS: "${CAPTION_WORKERS:-8}"
+    volumes:
+      # Subidas, resultados, base de datos de trabajos y caché de pesos del
+      # modelo. Todo el estado vive aquí; el contenedor es desechable.
+      - doc2md-data:/data
+
+volumes:
+  doc2md-data:

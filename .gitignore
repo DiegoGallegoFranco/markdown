@@ -9,6 +9,8 @@ missing_captions.txt
 # Documentos de entrada y resultados generados: nunca se versionan.
 # Este repo es solo el pipeline; los documentos son de cada usuario.
 output/
+# Estado de la app web: subidas, resultados, base de trabajos, caché de pesos.
+data/
 inventario.csv
 inventario_final.csv
 *.pdf

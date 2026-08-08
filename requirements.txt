@@ -1,5 +1,12 @@
-pymupdf4llm
-marker-pdf
-python-pptx
-anthropic
-python-dotenv
+# Núcleo del pipeline. Versiones EXACTAS a propósito: los parches de
+# patches/*.py reescriben líneas literales de marker-pdf 2.0.0 y surya-ocr
+# 0.22.1. Con rangos abiertos, pip trae otra versión, el parche no encuentra el
+# patrón y el layout inference de Marker cae a un modo degradado sin avisar.
+# Al subir cualquiera de estas dos, revisar patches/ ANTES de desplegar.
+pymupdf4llm==1.28.2
+pymupdf==1.28.2
+marker-pdf==2.0.0
+surya-ocr==0.22.1
+python-pptx==1.0.2
+anthropic==0.121.0
+python-dotenv==1.2.2

@@ -1,0 +1,88 @@
+{% extends "base.html" %}
+{% block content %}
+
+<div class="panel">
+  <form method="post" action="/jobs" enctype="multipart/form-data" id="form">
+    <label for="files">Documentos ({{ extensiones | join(", ") }} — máx. {{ max_mb }} MB por archivo)</label>
+    <input type="file" name="files" id="files" multiple
+           accept=".pdf,.docx,.pptx" required>
+
+    <label for="engine">Motor para PDFs</label>
+    <select name="engine" id="engine">
+      <option value="auto">Automático — clasifica cada PDF y elige (recomendado)</option>
+      <option value="pymupdf">pymupdf4llm — rápido, sin OCR, layout simple</option>
+      <option value="marker">Marker — OCR completo y multicolumna, mucho más lento</option>
+    </select>
+    <p class="muted" style="margin:.4rem 0 0">
+      El modo automático manda a Marker solo los PDFs escaneados o sin texto
+      seleccionable; el resto sale en segundos con pymupdf4llm.
+    </p>
+
+    {% if captions_disponible %}
+    <label class="check">
+      <input type="checkbox" name="captions" value="on">
+      Describir las imágenes con IA (las hace buscables por texto)
+    </label>
+    <p class="muted" style="margin:.3rem 0 0">
+      Envía cada imagen a la API de Claude. No lo actives con documentos sensibles.
+    </p>
+    {% else %}
+    <p class="muted" style="margin-top:1rem">
+      Captioning de imágenes deshabilitado (falta <code>ANTHROPIC_API_KEY</code> en el servidor).
+    </p>
+    {% endif %}
+
+    <button type="submit" id="enviar">Procesar</button>
+    {% if cola %}<span class="muted" style="margin-left:.75rem">{{ cola }} trabajo(s) en cola</span>{% endif %}
+  </form>
+</div>
+
+<h2>Trabajos</h2>
+{% if jobs %}
+<div class="panel tabla-scroll">
+  <table>
+    <thead>
+      <tr><th>Creado</th><th>Estado</th><th>Motor</th><th>Docs</th><th>Resultado</th><th></th></tr>
+    </thead>
+    <tbody>
+    {% for j in jobs %}
+      <tr>
+        <td><a href="/jobs/{{ j.id }}"><code>{{ j.id }}</code></a><br>
+            <span class="muted">{{ j.created_at.replace("T", " ")[:16] }}</span></td>
+        <td><span class="badge {{ j.status }}">{{ j.status }}</span>
+            {% if j.step %}<br><span class="muted">{{ j.step }}</span>{% endif %}</td>
+        <td>{{ j.engine }}</td>
+        <td>{{ j.n_done }}/{{ j.n_files }}</td>
+        <td>
+          {% if j.summary %}
+            {{ j.summary.ok }} OK
+            {% if j.summary.revision %}· {{ j.summary.revision }} revisar{% endif %}
+            {% if j.summary.fallidos %}· {{ j.summary.fallidos }} fallidos{% endif %}
+          {% elif j.error %}<span class="muted">{{ j.error[:60] }}</span>
+          {% else %}<span class="muted">—</span>{% endif %}
+        </td>
+        <td style="text-align:right">
+          {% if j.status == "done" %}<a class="btn" style="margin:0;padding:.35rem .75rem"
+             href="/jobs/{{ j.id }}/download">ZIP</a>{% endif %}
+        </td>
+      </tr>
+    {% endfor %}
+    </tbody>
+  </table>
+</div>
+{% else %}
+<div class="panel"><p class="muted" style="margin:0">Todavía no hay trabajos.</p></div>
+{% endif %}
+
+<script>
+  // Evita el doble envío en subidas grandes, donde el navegador tarda en responder.
+  document.getElementById("form").addEventListener("submit", function () {
+    const b = document.getElementById("enviar");
+    b.disabled = true; b.textContent = "Subiendo…";
+  });
+  // Refresco pasivo mientras haya trabajos en curso.
+  {% if jobs | selectattr("status", "in", ["queued", "running"]) | list %}
+  setTimeout(() => location.reload(), 5000);
+  {% endif %}
+</script>
+{% endblock %}

@@ -29,7 +29,21 @@ except ImportError:
     print("marker-pdf no está instalado en este entorno (pip install marker-pdf).", file=sys.stderr)
     sys.exit(1)
 
-output_path = Path(marker.__file__).parent / "output.py"
+def package_dir(module):
+    """Directorio de un paquete, sea normal o de espacio de nombres.
+
+    `marker` es un namespace package (no trae __init__.py), así que su
+    __file__ es None y `Path(module.__file__)` revienta con TypeError. La
+    ubicación real está en __path__.
+    """
+    if getattr(module, "__file__", None):
+        return Path(module.__file__).parent
+    for entry in getattr(module, "__path__", []):
+        return Path(entry)
+    raise RuntimeError(f"no se pudo localizar el paquete {module.__name__} en disco")
+
+
+output_path = package_dir(marker) / "output.py"
 if not output_path.exists():
     print(f"No se encontró {output_path}; puede que la estructura del paquete haya cambiado.", file=sys.stderr)
     sys.exit(1)
@@ -58,9 +72,15 @@ if new in text:
 
 n = text.count(old)
 if n == 0:
-    print("No se encontró el patrón esperado; revisar manualmente output.py "
-          "(puede que la versión instalada ya lo haya corregido o cambiado).", file=sys.stderr)
-    sys.exit(0)
+    # Salida NO cero a propósito: sin este parche, un bbox degenerado aborta la
+    # conversión COMPLETA del documento. Que el setup/build falle aquí es mucho
+    # más barato que perder 20+ minutos de proceso por documento.
+    print(f"ERROR: no se encontró el patrón esperado en {output_path}.\n"
+          f"       marker-pdf instalado: {getattr(marker, '__version__', 'desconocido')} "
+          f"(requirements.txt pinea 2.0.0).\n"
+          f"       Revisar si el bug de 'cannot write empty image as JPEG' sigue vigente "
+          f"antes de continuar.", file=sys.stderr)
+    sys.exit(1)
 
 text = text.replace(old, new)
 output_path.write_text(text, encoding="utf-8")
