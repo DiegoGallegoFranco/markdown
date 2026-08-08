@@ -39,6 +39,25 @@ def _log(log, msg: str) -> None:
         log(msg)
 
 
+def resolve_marker_mode() -> str:
+    """Modo a pasarle a marker_single ("" = que decida él).
+
+    Marker elige `balanced` cuando detecta GPU, pero ese modo necesita el
+    binario `llama-server`, que la imagen solo trae si se construyó con
+    WITH_LLAMA_SERVER=true. La combinación GPU + imagen sin ese binario hace
+    fallar TODAS las conversiones con "llama-server binary not found", y el
+    fallo aparece por documento, no al arrancar.
+
+    Si no está el binario se fuerza `fast`, que no lo necesita. En CPU marker
+    ya elegiría `fast` de todos modos, así que no se pierde nada.
+    """
+    if MARKER_MODE:
+        return MARKER_MODE
+    if shutil.which("llama-server") is None:
+        return "fast"
+    return ""
+
+
 def _result(src, out_dir, md_path, engine, started, **extra) -> dict:
     md_path = Path(md_path) if md_path else None
     text = md_path.read_text(encoding="utf-8", errors="replace") if md_path and md_path.exists() else ""
@@ -152,10 +171,18 @@ def convert_marker(src, out_root, input_root, skip_existing=False, log=None) -> 
                        skipped=True)
 
     out_dir.mkdir(parents=True, exist_ok=True)
+    modo = resolve_marker_mode()
     cmd = ["marker_single", str(src), "--output_dir", str(out_dir)]
-    if MARKER_MODE:
-        cmd += ["--mode", MARKER_MODE]
-    _log(log, f"  marker_single (modo: {MARKER_MODE or 'auto por dispositivo'}): "
+    if modo:
+        cmd += ["--mode", modo]
+    sin_llama = shutil.which("llama-server") is None
+    if sin_llama and not MARKER_MODE:
+        _log(log, "  AVISO: sin binario llama-server; se fuerza --mode fast "
+                  "(reconstruye con WITH_LLAMA_SERVER=true para usar balanced)")
+    elif sin_llama and modo == "balanced":
+        _log(log, "  AVISO: MARKER_MODE=balanced pero no hay binario llama-server; "
+                  "esto va a fallar. Reconstruye con WITH_LLAMA_SERVER=true o usa fast.")
+    _log(log, f"  marker_single (modo: {modo or 'auto por dispositivo'}): "
               f"{src.name} (puede tardar minutos)")
     try:
         proc = subprocess.run(cmd, capture_output=True, text=True, timeout=MARKER_TIMEOUT_S)

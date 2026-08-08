@@ -28,6 +28,13 @@ Dos motores para PDF, con trade-offs distintos:
   Esto importa para la decisión de hardware: en un servidor **sin GPU no solo
   vas más lento, corres un modo distinto y de menor calidad**.
 
+  **Trampa con GPU:** Marker elige `balanced` al ver una GPU, pero ese modo
+  necesita el binario `llama-server`, que la imagen Docker solo trae si se
+  construyó con `WITH_LLAMA_SERVER=true`. Esa combinación —GPU + imagen sin el
+  binario— haría fallar *todas* las conversiones. El pipeline lo detecta y cae
+  a `fast` con un aviso en el log, así que no revienta; para usar `balanced` de
+  verdad hay que reconstruir la imagen con ese build-arg.
+
 El **modo `auto`** (por defecto) hace la elección por documento: clasifica cada
 PDF con el inventario y manda a Marker solo los escaneados. Es lo que conviene
 en casi todos los casos.
@@ -150,7 +157,7 @@ sobreviven a un reinicio del servicio (se reanudan donde estaban).
 | `WORKERS` | `1` | Trabajos simultáneos. Con Marker dejar en 1: uno ya satura la máquina |
 | `MAX_UPLOAD_MB` | `500` | Tope por archivo |
 | `RETENTION_DAYS` | `14` | Borra trabajos terminados más antiguos (0 = nunca) |
-| `MARKER_MODE` | *(vacío)* | Vacío = Marker elige por dispositivo. `fast` o `balanced` para forzarlo |
+| `MARKER_MODE` | *(vacío)* | Vacío = Marker elige por dispositivo, pero se fuerza `fast` si falta `llama-server` |
 | `MARKER_TIMEOUT_S` | `14400` | Corta un documento colgado en vez de bloquear el lote |
 | `CAPTION_BACKEND` | `ollama` | `ollama` (local, nada sale) o `anthropic` (API externa) |
 | `OLLAMA_HOST` | `http://localhost:11434` | En Docker: `http://ollama:11434` (contenedor) o `http://host.docker.internal:11434` (host) |
