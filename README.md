@@ -148,8 +148,35 @@ uvicorn webapp.main:app --host 0.0.0.0 --port 8000
 
 Abrir `http://localhost:8000`. Permite subir varios documentos a la vez, elegir
 motor, activar el captioning, seguir el progreso en vivo y descargar el
-resultado como ZIP. Los trabajos se procesan en una cola en segundo plano y
-sobreviven a un reinicio del servicio (se reanudan donde estaban).
+resultado como ZIP.
+
+### Cómo se comporta la cola
+
+Puedes dejar varios lotes encolados y desentenderte:
+
+- Cada envío crea un **trabajo**, que se encola y se procesa en segundo plano.
+  La respuesta es inmediata: no hay que esperar con el navegador abierto.
+- Con `WORKERS=1` (el default, y lo correcto con Marker) los trabajos corren
+  **estrictamente de uno en uno**: el siguiente arranca cuando el anterior
+  termina, sin solaparse. Un documento con Marker ya satura la GPU.
+- Cada trabajo va `queued` → `running` → `done`/`error`, con su propio log y su
+  ZIP al terminar.
+- **Un trabajo que falla no detiene la cola**: queda en `error` y el siguiente
+  arranca igual. Dentro de un trabajo, un documento que falla tampoco aborta
+  los demás.
+- **Sobrevive a reinicios**: al arrancar, los trabajos que quedaron `running` o
+  `queued` se reencolan y continúan. Como la conversión salta lo ya hecho, se
+  reanuda en vez de rehacer. En el log verás `reanudados=N`.
+
+Al arrancar, el servicio deja en el log el diagnóstico de lo que va a usar —
+útil porque una GPU que no llega al contenedor degrada la conversión en
+silencio:
+
+```
+[webapp] listo (sin autenticación). workers=1 reanudados=0 purgados=0
+[webapp] conversión: GPU NVIDIA L4 · torch 2.13.0+cu130 · marker: auto por dispositivo
+[webapp] captions:   Ollama local (qwen3-vl:32b)
+```
 
 | Variable | Default | Para qué |
 |---|---|---|

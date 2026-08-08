@@ -39,6 +39,46 @@ def _log(log, msg: str) -> None:
         log(msg)
 
 
+def device_report() -> dict:
+    """Estado del acelerador, para dejarlo en el log al arrancar.
+
+    Sin esto, un contenedor que no ve la GPU convierte igual —en modo `fast`,
+    mucho más lento y peor— sin que nada lo diga: la degradación es invisible
+    hasta que alguien compara tiempos.
+    """
+    info = {
+        "torch": None,
+        "gpu": False,
+        "dispositivo": "cpu",
+        "llama_server": shutil.which("llama-server") is not None,
+        "modo_marker": resolve_marker_mode() or "auto por dispositivo",
+    }
+    try:
+        import torch
+        info["torch"] = torch.__version__
+        if torch.cuda.is_available():
+            info["gpu"] = True
+            info["dispositivo"] = torch.cuda.get_device_name(0)
+        elif getattr(torch.backends, "mps", None) and torch.backends.mps.is_available():
+            info["gpu"] = True
+            info["dispositivo"] = "mps (Apple Silicon)"
+    except ImportError:
+        info["dispositivo"] = "sin torch (imagen ligera: sin Marker/OCR)"
+    except Exception as e:  # driver roto, NVML caído, etc.
+        info["dispositivo"] = f"error consultando el dispositivo: {e}"
+    return info
+
+
+def device_summary() -> str:
+    d = device_report()
+    if d["gpu"]:
+        estado = f"GPU {d['dispositivo']}"
+    else:
+        estado = f"CPU ({d['dispositivo']})"
+    extra = "" if d["llama_server"] else " · sin llama-server: balanced no disponible"
+    return f"{estado} · torch {d['torch'] or 'n/d'} · marker: {d['modo_marker']}{extra}"
+
+
 def resolve_marker_mode() -> str:
     """Modo a pasarle a marker_single ("" = que decida él).
 

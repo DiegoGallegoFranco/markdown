@@ -26,6 +26,7 @@ from fastapi.responses import FileResponse, HTMLResponse, PlainTextResponse, Red
 from fastapi.templating import Jinja2Templates
 
 from pipeline import captions as captions_mod
+from pipeline import converters as converters_mod
 from pipeline.paths import SUPPORTED_EXTS
 from webapp import jobs
 
@@ -39,9 +40,16 @@ async def lifespan(app: FastAPI):
     purgados = jobs.purge_old()
     jobs.start_workers()
     reanudados = jobs.requeue_orphans()
+    # flush explícito: fuera de Docker (donde el Dockerfile fija
+    # PYTHONUNBUFFERED=1) stdout va bloque-bufferizado y el diagnóstico de
+    # arranque no aparecería hasta llenar el búfer.
     print(f"[webapp] listo (sin autenticación). workers={jobs.WORKERS} "
-          f"reanudados={reanudados} purgados={purgados} "
-          f"captions={captions_mod.backend_disponible()[1]}")
+          f"reanudados={reanudados} purgados={purgados}", flush=True)
+    # Se dejan en el log al arrancar: una GPU que no se ve degrada la
+    # conversión en silencio, y un Ollama inalcanzable solo se descubriría al
+    # subir el primer documento.
+    print(f"[webapp] conversión: {converters_mod.device_summary()}", flush=True)
+    print(f"[webapp] captions:   {captions_mod.backend_disponible()[1]}", flush=True)
     yield
 
 
