@@ -39,7 +39,7 @@ pipeline/          núcleo: rutas, inventario, conversores, captions, QC
   paths.py         resolución de rutas de entrada/salida
   inventory.py     fase 1 — clasificar nativo vs escaneado
   converters.py    pymupdf4llm / Marker / pandoc / python-pptx
-  captions.py      descripción de imágenes con la API de Claude (reanudable)
+  captions.py      descripción de imágenes (Ollama local o API, reanudable)
   qc.py            fase 4 — validación e inventario final
   cli.py           CLI unificada (python -m pipeline)
 webapp/            interfaz web (FastAPI) + cola de trabajos (SQLite)
@@ -94,8 +94,8 @@ python -m pipeline convertir "/ruta/doc1.pdf" "/ruta/doc2.pdf" --engine auto
 # Fase 3 — lote completo (acepta archivos o directorios, rutas absolutas)
 python -m pipeline convertir /ruta/a/documentos --engine auto --skip-existing
 
-# Descripción de imágenes (opcional, requiere ANTHROPIC_API_KEY)
-python -m pipeline captions --dry-run     # cuenta, no llama a la API
+# Descripción de imágenes (opcional; por defecto con Ollama local)
+python -m pipeline captions --dry-run     # cuenta, no llama al modelo
 python -m pipeline captions --limit 3     # smoke test
 python -m pipeline captions               # todo
 
@@ -148,15 +148,15 @@ sobreviven a un reinicio del servicio (se reanudan donde estaban).
 |---|---|---|
 | `DATA_DIR` | `data` | Dónde viven subidas, resultados y la base de trabajos |
 | `WORKERS` | `1` | Trabajos simultáneos. Con Marker dejar en 1: uno ya satura la máquina |
-| `ANTHROPIC_API_KEY` | — | Habilita el paso opcional de captioning |
 | `MAX_UPLOAD_MB` | `500` | Tope por archivo |
 | `RETENTION_DAYS` | `14` | Borra trabajos terminados más antiguos (0 = nunca) |
 | `MARKER_MODE` | *(vacío)* | Vacío = Marker elige por dispositivo. `fast` o `balanced` para forzarlo |
 | `MARKER_TIMEOUT_S` | `14400` | Corta un documento colgado en vez de bloquear el lote |
 | `CAPTION_BACKEND` | `ollama` | `ollama` (local, nada sale) o `anthropic` (API externa) |
-| `OLLAMA_HOST` | `http://localhost:11434` | En Docker: `http://host.docker.internal:11434` |
+| `OLLAMA_HOST` | `http://localhost:11434` | En Docker: `http://ollama:11434` (contenedor) o `http://host.docker.internal:11434` (host) |
 | `CAPTION_MODEL` | `qwen3-vl:32b` | Modelo de visión (o `claude-sonnet-5` con backend anthropic) |
-| `CAPTION_WORKERS` | `2` (ollama) | Ollama atiende de a una; subirlo no acelera |
+| `CAPTION_WORKERS` | `1` (ollama) | Ollama atiende de a una; subirlo no acelera |
+| `ANTHROPIC_API_KEY` | — | Solo con `CAPTION_BACKEND=anthropic` |
 | `OLLAMA_TIMEOUT_S` | `300` | Un 30B tarda decenas de segundos por imagen |
 
 > **La app no tiene autenticación.** Cualquiera que alcance el puerto puede
@@ -340,29 +340,54 @@ vez de acumular un error por imagen a mitad de un lote de horas.
 
 #### Ollama en el servidor con Docker
 
-Un detalle que rompe el despliegue si se pasa por alto: **Ollama escucha por
-defecto solo en `127.0.0.1`**, así que desde el contenedor —que llega por la
-interfaz de Docker— la conexión es rechazada. Hay que abrirlo al host:
+**Desde dentro del contenedor, `localhost` es el propio contenedor**, nunca el
+servidor. La configuración depende de dónde viva Ollama, y son dos escenarios
+bien distintos:
+
+**A) Ollama en su propio contenedor** (lo habitual si ya usas open-webui).
+Ambos servicios tienen que compartir una red Docker, y se le habla por **nombre
+de servicio y puerto interno** (11434), no por el puerto publicado en el host:
+
+```bash
+# Averigua la red del compose de Ollama:
+docker network ls | grep -i ollama
+docker inspect <contenedor-de-ollama> --format '{{json .NetworkSettings.Networks}}'
+```
+
+```yaml
+# docker-compose.yml — ya viene configurado así
+    environment:
+      OLLAMA_HOST: "http://ollama:11434"
+    networks:
+      - default        # explícito: al declarar redes, Compose deja de añadirla sola
+      - ollama-net
+networks:
+  ollama-net:
+    external: true
+    name: ollama-models_ollama-net   # ajusta al nombre real de tu red
+```
+
+**B) Ollama en el host** (instalado con systemd). Escucha solo en `127.0.0.1`,
+así que hay que abrirlo antes:
 
 ```bash
 sudo systemctl edit ollama
-```
-```ini
-[Service]
-Environment="OLLAMA_HOST=0.0.0.0:11434"
-```
-```bash
+#   [Service]
+#   Environment="OLLAMA_HOST=0.0.0.0:11434"
 sudo systemctl restart ollama
+```
+Y entonces `OLLAMA_HOST=http://host.docker.internal:11434` (el
+`extra_hosts: host.docker.internal:host-gateway` del compose lo hace resoluble
+en Linux; en Mac y Windows ya existe).
 
-# Verificar desde el contenedor (debe listar tus modelos):
+**Verificación, en cualquiera de los dos casos** — debe listar tus modelos:
+
+```bash
 docker compose exec app sh -c 'curl -s "$OLLAMA_HOST/api/tags"'
 ```
 
-Si prefieres no exponer Ollama ni siquiera a la red local, la alternativa es
-`network_mode: host` en el servicio, y entonces `OLLAMA_HOST=http://localhost:11434`.
-
-El `docker-compose.yml` ya trae `extra_hosts: host.docker.internal:host-gateway`,
-que en Linux es necesario (en Mac y Windows Docker lo define solo).
+Si falla, el preflight del captioning te lo dirá al arrancar la app, en el log:
+`captions=no se pudo contactar Ollama en ...`.
 
 - **Es reanudable**: las imágenes que ya tienen caption se detectan y se saltan
   sin llamar al modelo. Reejecutar tras un fallo a mitad de lote no repite

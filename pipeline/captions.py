@@ -201,8 +201,11 @@ def check_ollama(model=DEFAULT_MODEL, host=None) -> None:
         raise OllamaError(
             f"no se pudo contactar Ollama en {host}: {e}\n"
             f"       ¿Está corriendo? Pruébalo con: curl {host}/api/tags\n"
-            f"       Desde un contenedor, OLLAMA_HOST debe apuntar al host "
-            f"(http://host.docker.internal:11434), no a localhost."
+            f"       Desde un contenedor, 'localhost' es el propio contenedor. "
+            f"OLLAMA_HOST debe ser:\n"
+            f"         - http://ollama:11434            si Ollama es otro contenedor "
+            f"(hace falta compartir su red)\n"
+            f"         - http://host.docker.internal:11434  si Ollama corre en el host"
         ) from e
     # Ollama admite el nombre sin tag (usa :latest); se acepta esa forma.
     if model not in disponibles and f"{model}:latest" not in disponibles \

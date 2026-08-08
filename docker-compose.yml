@@ -29,24 +29,38 @@ services:
       # Captioning de imágenes. Por defecto "ollama": el modelo corre en TU
       # servidor y las imágenes no salen de la máquina.
       CAPTION_BACKEND: "${CAPTION_BACKEND:-ollama}"
-      # host.docker.internal resuelve al host gracias al extra_hosts de abajo.
-      # Apuntar a "localhost" desde dentro del contenedor NO funciona: sería el
-      # propio contenedor, no el servidor.
-      OLLAMA_HOST: "${OLLAMA_HOST:-http://host.docker.internal:11434}"
+      # Ollama corre en su propio contenedor, dentro de la red ollama-net (ver
+      # abajo). Se le habla por nombre de servicio y con su PUERTO INTERNO
+      # (11434), no por el que publica en el host. "localhost" desde dentro del
+      # contenedor NO funciona: sería el propio contenedor.
+      OLLAMA_HOST: "${OLLAMA_HOST:-http://ollama:11434}"
       CAPTION_MODEL: "${CAPTION_MODEL:-qwen3-vl:32b}"
       OLLAMA_TIMEOUT_S: "${OLLAMA_TIMEOUT_S:-300}"
       # Ollama serializa: más hilos no aceleran y pueden agotar la VRAM.
-      CAPTION_WORKERS: "${CAPTION_WORKERS:-2}"
+      CAPTION_WORKERS: "${CAPTION_WORKERS:-1}"
       # Solo si CAPTION_BACKEND=anthropic (las imágenes saldrían a un tercero).
       ANTHROPIC_API_KEY: "${ANTHROPIC_API_KEY:-}"
-    # Hace que host.docker.internal apunte al host también en Linux, donde
-    # Docker no lo define solo (en Mac y Windows ya existe).
+    # Ya no hace falta para Ollama, pero se deja por si algún día hay que
+    # apuntar a un servicio que sí viva en el host (Docker no define
+    # host.docker.internal solo en Linux; en Mac y Windows ya existe).
     extra_hosts:
       - "host.docker.internal:host-gateway"
+    # "default" debe ir explícito: al declarar redes, Compose deja de adjuntar
+    # el servicio a la red por defecto del proyecto.
+    networks:
+      - default
+      - ollama-net
     volumes:
       # Subidas, resultados, base de datos de trabajos y caché de pesos del
       # modelo. Todo el estado vive aquí; el contenedor es desechable.
       - doc2md-data:/data
+
+networks:
+  # Red creada por el compose del proyecto ollama-models. Es la misma por la
+  # que open-webui ya alcanza a Ollama.
+  ollama-net:
+    external: true
+    name: ollama-models_ollama-net
 
 volumes:
   doc2md-data:
