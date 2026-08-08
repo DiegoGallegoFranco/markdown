@@ -95,8 +95,9 @@ def cmd_captions(args) -> int:
         imgs = [Path(l.strip()) for l in Path(args.from_file).read_text().splitlines() if l.strip()]
     try:
         captions_mod.run(args.output, model=args.model, workers=args.workers,
-                         limit=args.limit, images=imgs, log=_log, dry_run=args.dry_run)
-    except RuntimeError as e:
+                         limit=args.limit, images=imgs, log=_log, dry_run=args.dry_run,
+                         backend=args.backend, host=args.ollama_host)
+    except (RuntimeError, captions_mod.OllamaError) as e:
         print(f"ERROR: {e}", file=sys.stderr)
         return 1
     return 0
@@ -150,6 +151,7 @@ def cmd_todo(args) -> int:
         cmd_captions(argparse.Namespace(
             output=args.out, model=args.model, workers=args.workers,
             limit=None, from_file=None, dry_run=False,
+            backend=captions_mod.CAPTION_BACKEND, ollama_host=captions_mod.OLLAMA_HOST,
         ))
     print("\n=== Control de calidad ===")
     cmd_qc(argparse.Namespace(output=args.out, csv=None))
@@ -186,7 +188,11 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--workers", type=int, default=captions_mod.DEFAULT_WORKERS)
     sp.add_argument("--limit", type=int, default=None, help="Smoke test: procesar solo N")
     sp.add_argument("--from-file", default=None, help="Archivo con una ruta de imagen por línea")
-    sp.add_argument("--dry-run", action="store_true", help="Solo contar, no llamar a la API")
+    sp.add_argument("--dry-run", action="store_true", help="Solo contar, no llamar al modelo")
+    sp.add_argument("--backend", choices=["ollama", "anthropic"],
+                    default=captions_mod.CAPTION_BACKEND,
+                    help="ollama = local, nada sale de la máquina (default)")
+    sp.add_argument("--ollama-host", default=captions_mod.OLLAMA_HOST)
     sp.set_defaults(func=cmd_captions)
 
     sp = sub.add_parser("captions-audit", help="Listar imágenes sin caption")

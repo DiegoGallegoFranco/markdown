@@ -18,7 +18,6 @@ o una VPN).
 """
 from __future__ import annotations
 
-import os
 from contextlib import asynccontextmanager
 from pathlib import Path
 
@@ -26,6 +25,7 @@ from fastapi import FastAPI, Form, HTTPException, Request, UploadFile
 from fastapi.responses import FileResponse, HTMLResponse, PlainTextResponse, RedirectResponse
 from fastapi.templating import Jinja2Templates
 
+from pipeline import captions as captions_mod
 from pipeline.paths import SUPPORTED_EXTS
 from webapp import jobs
 
@@ -41,7 +41,7 @@ async def lifespan(app: FastAPI):
     reanudados = jobs.requeue_orphans()
     print(f"[webapp] listo (sin autenticación). workers={jobs.WORKERS} "
           f"reanudados={reanudados} purgados={purgados} "
-          f"captions={'sí' if os.environ.get('ANTHROPIC_API_KEY') else 'no'}")
+          f"captions={captions_mod.backend_disponible()[1]}")
     yield
 
 
@@ -62,11 +62,15 @@ def _safe_name(filename: str) -> str:
 
 @app.get("/", response_class=HTMLResponse)
 async def index(request: Request):
+    captions_disp, captions_motivo = captions_mod.backend_disponible()
     # Starlette >= 0.29: el Request va primero; la forma antigua
     # TemplateResponse(nombre, {"request": ...}) ya no funciona.
     return TEMPLATES.TemplateResponse(request, "index.html", {
         "jobs": jobs.list_jobs(),
-        "captions_disponible": bool(os.environ.get("ANTHROPIC_API_KEY")),
+        # El captioning ya no depende de una clave: con backend ollama basta
+        # con que el servidor responda y tenga el modelo.
+        "captions_disponible": captions_disp,
+        "captions_motivo": captions_motivo,
         "max_mb": jobs.MAX_UPLOAD_MB,
         "extensiones": sorted(SUPPORTED_EXTS),
         "cola": jobs.queue_depth(),
@@ -87,7 +91,7 @@ async def crear_job(
         raise HTTPException(400, "No se subió ningún archivo")
 
     quiere_captions = captions in ("on", "true", "1", "yes")
-    job_id = jobs.create_job(engine, quiere_captions and bool(os.environ.get("ANTHROPIC_API_KEY")))
+    job_id = jobs.create_job(engine, quiere_captions and captions_mod.backend_disponible()[0])
     input_dir = jobs.job_dir(job_id) / "input"
 
     guardados = 0

@@ -26,11 +26,23 @@ services:
       MARKER_TIMEOUT_S: "${MARKER_TIMEOUT_S:-14400}"
       MAX_UPLOAD_MB: "${MAX_UPLOAD_MB:-500}"
       RETENTION_DAYS: "${RETENTION_DAYS:-14}"
-      # Opcional: habilita el captioning de imágenes. Si los documentos son
-      # sensibles, dejarla vacía — las imágenes saldrían de la máquina.
+      # Captioning de imágenes. Por defecto "ollama": el modelo corre en TU
+      # servidor y las imágenes no salen de la máquina.
+      CAPTION_BACKEND: "${CAPTION_BACKEND:-ollama}"
+      # host.docker.internal resuelve al host gracias al extra_hosts de abajo.
+      # Apuntar a "localhost" desde dentro del contenedor NO funciona: sería el
+      # propio contenedor, no el servidor.
+      OLLAMA_HOST: "${OLLAMA_HOST:-http://host.docker.internal:11434}"
+      CAPTION_MODEL: "${CAPTION_MODEL:-qwen3-vl:32b}"
+      OLLAMA_TIMEOUT_S: "${OLLAMA_TIMEOUT_S:-300}"
+      # Ollama serializa: más hilos no aceleran y pueden agotar la VRAM.
+      CAPTION_WORKERS: "${CAPTION_WORKERS:-2}"
+      # Solo si CAPTION_BACKEND=anthropic (las imágenes saldrían a un tercero).
       ANTHROPIC_API_KEY: "${ANTHROPIC_API_KEY:-}"
-      CAPTION_MODEL: "${CAPTION_MODEL:-claude-sonnet-5}"
-      CAPTION_WORKERS: "${CAPTION_WORKERS:-8}"
+    # Hace que host.docker.internal apunte al host también en Linux, donde
+    # Docker no lo define solo (en Mac y Windows ya existe).
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     volumes:
       # Subidas, resultados, base de datos de trabajos y caché de pesos del
       # modelo. Todo el estado vive aquí; el contenedor es desechable.

@@ -24,11 +24,14 @@
       Describir las imágenes con IA (las hace buscables por texto)
     </label>
     <p class="muted" style="margin:.3rem 0 0">
-      Envía cada imagen a la API de Claude. No lo actives con documentos sensibles.
+      {{ captions_motivo }}.
+      {% if "Ollama" in captions_motivo %}Las imágenes no salen del servidor.
+      {% else %}Cada imagen se envía a un servicio externo — no lo actives con
+      documentos sensibles.{% endif %}
     </p>
     {% else %}
     <p class="muted" style="margin-top:1rem">
-      Captioning de imágenes deshabilitado (falta <code>ANTHROPIC_API_KEY</code> en el servidor).
+      Captioning de imágenes no disponible: {{ captions_motivo }}.
     </p>
     {% endif %}
 

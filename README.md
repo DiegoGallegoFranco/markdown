@@ -153,6 +153,11 @@ sobreviven a un reinicio del servicio (se reanudan donde estaban).
 | `RETENTION_DAYS` | `14` | Borra trabajos terminados más antiguos (0 = nunca) |
 | `MARKER_MODE` | *(vacío)* | Vacío = Marker elige por dispositivo. `fast` o `balanced` para forzarlo |
 | `MARKER_TIMEOUT_S` | `14400` | Corta un documento colgado en vez de bloquear el lote |
+| `CAPTION_BACKEND` | `ollama` | `ollama` (local, nada sale) o `anthropic` (API externa) |
+| `OLLAMA_HOST` | `http://localhost:11434` | En Docker: `http://host.docker.internal:11434` |
+| `CAPTION_MODEL` | `qwen3-vl:32b` | Modelo de visión (o `claude-sonnet-5` con backend anthropic) |
+| `CAPTION_WORKERS` | `2` (ollama) | Ollama atiende de a una; subirlo no acelera |
+| `OLLAMA_TIMEOUT_S` | `300` | Un 30B tarda decenas de segundos por imagen |
 
 > **La app no tiene autenticación.** Cualquiera que alcance el puerto puede
 > subir documentos, ver los de los demás y borrarlos. Por eso el
@@ -310,27 +315,68 @@ Las imágenes se extraen como archivos separados con enlaces relativos
 
 Para que el contenido de diagramas/mapas/tablas-como-imagen sea *buscable por
 texto* (un RAG de solo texto no puede "ver" una imagen), se genera una vez una
-descripción corta de cada imagen y se inserta justo debajo:
+descripción corta de cada imagen y se inserta justo debajo.
+
+Dos backends con la misma interfaz, vía `CAPTION_BACKEND`:
+
+| Backend | Modelo por defecto | Privacidad | Velocidad |
+|---|---|---|---|
+| **`ollama`** (default) | `qwen3-vl:32b` | **Las imágenes no salen de la máquina** | Lento (decenas de s/imagen) |
+| `anthropic` | `claude-sonnet-5` | Cada imagen viaja a un tercero | Rápido (minutos por lote) |
 
 ```bash
 python -m pipeline captions --limit 3    # smoke test
 python -m pipeline captions              # todo
 python -m pipeline captions-audit        # verificar 1 caption por imagen
+
+# Forzar backend o modelo puntualmente
+python -m pipeline captions --backend ollama --model qwen3-vl:30b
+python -m pipeline captions --ollama-host http://otra-maquina:11434
 ```
 
+Antes de procesar el lote se hace un **preflight**: si el servidor no responde o
+el modelo no está descargado, falla de inmediato con un mensaje accionable en
+vez de acumular un error por imagen a mitad de un lote de horas.
+
+#### Ollama en el servidor con Docker
+
+Un detalle que rompe el despliegue si se pasa por alto: **Ollama escucha por
+defecto solo en `127.0.0.1`**, así que desde el contenedor —que llega por la
+interfaz de Docker— la conexión es rechazada. Hay que abrirlo al host:
+
+```bash
+sudo systemctl edit ollama
+```
+```ini
+[Service]
+Environment="OLLAMA_HOST=0.0.0.0:11434"
+```
+```bash
+sudo systemctl restart ollama
+
+# Verificar desde el contenedor (debe listar tus modelos):
+docker compose exec app sh -c 'curl -s "$OLLAMA_HOST/api/tags"'
+```
+
+Si prefieres no exponer Ollama ni siquiera a la red local, la alternativa es
+`network_mode: host` en el servicio, y entonces `OLLAMA_HOST=http://localhost:11434`.
+
+El `docker-compose.yml` ya trae `extra_hosts: host.docker.internal:host-gateway`,
+que en Linux es necesario (en Mac y Windows Docker lo define solo).
+
 - **Es reanudable**: las imágenes que ya tienen caption se detectan y se saltan
-  sin llamar a la API. Reejecutar tras un fallo a mitad de lote no repaga nada
-  ni duplica descripciones. (`captions-dedup` sigue disponible para limpiar
-  duplicados heredados de corridas anteriores.)
-- Rápido y barato: minutos y ~$1-2 para varios cientos de imágenes. Requiere
-  `ANTHROPIC_API_KEY`. Modelo configurable con `CAPTION_MODEL` (default
-  `claude-sonnet-5`; `claude-haiku-4-5` sale más barato).
-- **Alternativa 100% local** (sin costo, sin que las imágenes salgan de la
-  máquina — preferible si los documentos son sensibles): un modelo de visión
-  pequeño vía `llama.cpp`/GGUF (ya instalado si se usó Marker). Buenas opciones
-  para Apple Silicon: `Qwen3-VL-4B` o `MiniCPM-V 4.6`. No incluido como script
-  todavía: reusar el mismo patrón de `llama-server` que usa Marker, cambiando el
-  modelo GGUF.
+  sin llamar al modelo. Reejecutar tras un fallo a mitad de lote no repite
+  trabajo ni duplica descripciones. (`captions-dedup` sigue disponible para
+  limpiar duplicados heredados de corridas anteriores.)
+- **Local (`ollama`, por defecto)**: sin costo, sin clave y sin que las imágenes
+  salgan de la máquina. `qwen3-vl:32b` (21 GB) o `:30b` (20 GB) si la GPU tiene
+  24 GB; `qwen3-vl:8b` (6.1 GB) o `:4b` (3.3 GB) con menos memoria — un equipo
+  de 18 GB no puede con los de 30B+. A cambio es lento: decenas de segundos por
+  imagen, frente a minutos por lote completo vía API.
+- **API (`anthropic`)**: minutos y ~$1-2 para varios cientos de imágenes, con
+  `ANTHROPIC_API_KEY` y `CAPTION_MODEL=claude-sonnet-5`. Mejor calidad y mucho
+  más rápido, pero cada imagen viaja a un tercero — no usar con documentos
+  sensibles.
 - **Cuidado con la concurrencia**: si varios hilos escriben el mismo `.md` sin
   lock hay *lost updates* (captions que desaparecen sin error visible).
   `pipeline/captions.py` usa un lock por archivo — no quitarlo.

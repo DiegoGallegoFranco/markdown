@@ -204,10 +204,11 @@ def _run_job(job_id: str) -> None:
 
         if job["captions"]:
             update(job_id, step="captions")
-            if not os.environ.get("ANTHROPIC_API_KEY"):
-                log("AVISO: se pidió captioning pero falta ANTHROPIC_API_KEY. Paso omitido.")
+            disponible, motivo = captions_mod.backend_disponible()
+            if not disponible:
+                log(f"AVISO: se pidió captioning pero el backend no está listo ({motivo}). Paso omitido.")
             else:
-                log("Generando descripciones de imágenes...")
+                log(f"Generando descripciones de imágenes con {motivo}...")
                 captions_mod.run(output_dir, log=log)
 
         update(job_id, step="qc")
