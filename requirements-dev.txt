@@ -1,0 +1,11 @@
+# Dependencias para ejecutar la suite de tests (tests/). Se instala sobre el
+# núcleo ligero y la web: los tests NO necesitan marker-pdf, GPU, Ollama, red
+# ni la API de Anthropic (todo eso se simula con dobles de prueba).
+#
+#   pip install -r requirements-dev.txt
+#   python -m pytest -q
+-r requirements-light.txt
+-r requirements-web.txt
+pytest==8.4.2
+# Cliente HTTP en proceso (httpx.ASGITransport / TestClient de FastAPI).
+httpx==0.28.1
