@@ -36,6 +36,10 @@ JOBS_DIR = DATA_DIR / "jobs"
 WORKERS = int(os.environ.get("WORKERS", "1"))
 RETENTION_DAYS = int(os.environ.get("RETENTION_DAYS", "14"))
 MAX_UPLOAD_MB = int(os.environ.get("MAX_UPLOAD_MB", "500"))
+# Cada cuánto se revisan los jobs caducados (RETENTION_DAYS). Sin esto la purga
+# solo ocurría al arrancar, y un servicio que lleva meses sin reiniciarse no
+# borraba nunca los documentos subidos.
+PURGE_INTERVAL_H = float(os.environ.get("PURGE_INTERVAL_H", "6"))
 
 STATUS_QUEUED, STATUS_RUNNING, STATUS_DONE, STATUS_ERROR = "queued", "running", "done", "error"
 
@@ -131,7 +135,15 @@ def list_jobs(limit: int = 50) -> list[dict]:
     return out
 
 
+def is_running(job_id: str) -> bool:
+    job = get(job_id)
+    return job is not None and job["status"] == STATUS_RUNNING
+
+
 def delete_job(job_id: str) -> bool:
+    """Borra el job y sus archivos. No comprueba el estado: quien lo llame
+    desde la web debe rechazar antes los jobs en ejecución (is_running), porque
+    el worker seguiría escribiendo en una carpeta que ya no existe."""
     with _connect() as conn:
         cur = conn.execute("DELETE FROM jobs WHERE id = ?", (job_id,))
     shutil.rmtree(job_dir(job_id), ignore_errors=True)
@@ -150,8 +162,14 @@ def read_log(job_id: str, tail: int | None = None) -> str:
 
 def _append_log(job_id: str, msg: str) -> None:
     stamp = datetime.now(timezone.utc).strftime("%H:%M:%S")
-    with open(job_dir(job_id) / "job.log", "a", encoding="utf-8") as f:
-        f.write(f"[{stamp}] {msg}\n")
+    try:
+        with open(job_dir(job_id) / "job.log", "a", encoding="utf-8") as f:
+            f.write(f"[{stamp}] {msg}\n")
+    except FileNotFoundError:
+        # La carpeta del job ya no existe: se borró (a mano o por retención)
+        # mientras estaba en cola. No hay dónde registrar, y lanzar aquí
+        # —típicamente desde el `except` de _run_job— mataría al worker.
+        pass
 
 
 # --------------------------------------------------------------------------- ejecución
@@ -166,8 +184,8 @@ def _run_job(job_id: str) -> None:
     def log(msg):
         _append_log(job_id, str(msg))
 
-    update(job_id, status=STATUS_RUNNING, started_at=_now(), step="inventario", error=None)
     try:
+        update(job_id, status=STATUS_RUNNING, started_at=_now(), step="inventario", error=None)
         docs = collect_documents(input_dir, exts=SUPPORTED_EXTS)
         if not docs:
             raise RuntimeError("no se subió ningún documento con extensión soportada "
@@ -189,27 +207,41 @@ def _run_job(job_id: str) -> None:
 
         update(job_id, step="conversion")
         results = []
-        for n, src in enumerate(docs, start=1):
-            log(f"[{n}/{len(docs)}] {src.name} (motor: {engines.get(src, converters.engine_for(src))})")
-            r = converters.convert(src, output_dir, input_dir,
-                                   pdf_engine=engines.get(src, "pymupdf"),
-                                   skip_existing=True, log=log)
-            results.append(r)
-            update(job_id, n_done=n)
+        # VLM de Marker cargado una vez por job; se apaga al salir del bloque,
+        # antes del captioning, para dejarle la VRAM a Ollama.
+        with converters.marker_session(log):
+            for n, src in enumerate(docs, start=1):
+                log(f"[{n}/{len(docs)}] {src.name} (motor: {engines.get(src, converters.engine_for(src))})")
+                r = converters.convert(src, output_dir, input_dir,
+                                       pdf_engine=engines.get(src, "pymupdf"),
+                                       skip_existing=True, log=log)
+                results.append(r)
+                update(job_id, n_done=n)
 
         # Se indexa por el nombre SANEADO: el .md se llama como el slug, no
         # como el archivo original, así que cruzar por el nombre de entrada
         # dejaría la columna de duración vacía.
         durations = {slugify(Path(r["src"]).stem): r["duracion_s"] for r in results if r["ok"]}
 
+        captions_error = None
         if job["captions"]:
             update(job_id, step="captions")
-            disponible, motivo = captions_mod.backend_disponible()
-            if not disponible:
-                log(f"AVISO: se pidió captioning pero el backend no está listo ({motivo}). Paso omitido.")
-            else:
-                log(f"Generando descripciones de imágenes con {motivo}...")
-                captions_mod.run(output_dir, log=log)
+            # El captioning es un extra sobre una conversión que ya está hecha
+            # (y que puede haber costado horas de Marker): si Ollama/la API se
+            # cae a mitad, se avisa y se entrega igualmente el zip con los .md,
+            # en vez de tirar el job entero y perder el resultado.
+            try:
+                disponible, motivo = captions_mod.backend_disponible()
+                if not disponible:
+                    log(f"AVISO: se pidió captioning pero el backend no está listo ({motivo}). Paso omitido.")
+                else:
+                    log(f"Generando descripciones de imágenes con {motivo}...")
+                    captions_mod.run(output_dir, log=log)
+            except Exception as e:
+                captions_error = f"{type(e).__name__}: {e}"
+                log(f"AVISO: el captioning falló y se omite ({captions_error}). "
+                    f"La conversión sigue y el zip se genera sin descripciones (o con las que alcanzaran a escribirse).\n"
+                    f"{traceback.format_exc()}")
 
         update(job_id, step="qc")
         rows = qc.run(output_dir, root=output_dir, durations=durations)
@@ -221,6 +253,8 @@ def _run_job(job_id: str) -> None:
             {"documento": Path(r["src"]).name, "error": r["error"]}
             for r in results if not r["ok"]
         ]
+        if captions_error:
+            resumen["captions_error"] = captions_error
         log(f"QC: {resumen['ok']} OK, {resumen['revision']} para revisión, "
             f"{resumen['error']} con error")
 
@@ -236,10 +270,23 @@ def _run_job(job_id: str) -> None:
 
 
 def _worker_loop() -> None:
+    # Ninguna excepción puede salir de este bucle: si sale, el hilo muere y con
+    # WORKERS=1 la cola se queda parada para siempre sin ningún error visible
+    # (los trabajos siguen entrando como "queued" y nadie los procesa).
     while True:
         job_id = _queue.get()
         try:
             _run_job(job_id)
+        except BaseException as e:  # noqa: BLE001 — a propósito, ver arriba
+            if isinstance(e, (KeyboardInterrupt, SystemExit)):
+                raise
+            print(f"[worker] job {job_id} falló fuera de su manejo de errores:\n"
+                  f"{traceback.format_exc()}", flush=True)
+            try:
+                update(job_id, status=STATUS_ERROR, finished_at=_now(), step=None,
+                       error=f"error interno del worker: {e}")
+            except Exception:
+                pass  # p. ej. SQLite bloqueado: el hilo sigue vivo igualmente
         finally:
             _queue.task_done()
 
@@ -252,12 +299,21 @@ def queue_depth() -> int:
     return _queue.qsize()
 
 
+_worker_threads: list[threading.Thread] = []
+
+
 def start_workers() -> None:
     if _workers_started.is_set():
         return
     _workers_started.set()
     for i in range(WORKERS):
-        threading.Thread(target=_worker_loop, name=f"pipeline-worker-{i}", daemon=True).start()
+        t = threading.Thread(target=_worker_loop, name=f"pipeline-worker-{i}", daemon=True)
+        t.start()
+        _worker_threads.append(t)
+
+
+def workers_alive() -> int:
+    return sum(1 for t in _worker_threads if t.is_alive())
 
 
 def requeue_orphans() -> int:
@@ -292,3 +348,37 @@ def purge_old(days: int = RETENTION_DAYS) -> int:
     for row in rows:
         delete_job(row["id"])
     return len(rows)
+
+
+_purge_stop = threading.Event()
+_purge_thread: threading.Thread | None = None
+
+
+def _purge_loop(interval_s: float) -> None:
+    # wait() en vez de sleep(): permite pararlo limpio (y en tests) sin esperar.
+    while not _purge_stop.wait(interval_s):
+        try:
+            n = purge_old()
+            if n:
+                print(f"[purga] {n} trabajo(s) de más de {RETENTION_DAYS} días borrado(s)", flush=True)
+        except Exception:
+            # Un fallo puntual (disco, SQLite bloqueado) no debe matar el hilo:
+            # se reintenta en la siguiente vuelta.
+            print(f"[purga] error:\n{traceback.format_exc()}", flush=True)
+
+
+def start_purger(interval_h: float = PURGE_INTERVAL_H) -> None:
+    """Purga periódica en segundo plano. La primera pasada la hace el arranque."""
+    global _purge_thread
+    if RETENTION_DAYS <= 0 or interval_h <= 0:
+        return
+    if _purge_thread and _purge_thread.is_alive():
+        return
+    _purge_stop.clear()
+    _purge_thread = threading.Thread(target=_purge_loop, args=(interval_h * 3600,),
+                                     name="purga-retencion", daemon=True)
+    _purge_thread.start()
+
+
+def stop_purger() -> None:
+    _purge_stop.set()

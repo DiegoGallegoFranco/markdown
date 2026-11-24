@@ -73,13 +73,16 @@ def cmd_convertir(args) -> int:
     engines = _engine_map(docs, args.engine)
 
     results = []
-    for n, src in enumerate(docs, start=1):
-        _log(f"[{n}/{len(docs)}] {src.name}")
-        pdf_engine = engines.get(src, "pymupdf")
-        results.append(converters.convert(
-            src, args.out, input_root, pdf_engine=pdf_engine,
-            skip_existing=args.skip_existing, log=_log,
-        ))
+    # El VLM de Marker se carga una vez para todo el lote y se apaga al final,
+    # antes del captioning (que en `todo` usa la misma GPU vía Ollama).
+    with converters.marker_session(_log):
+        for n, src in enumerate(docs, start=1):
+            _log(f"[{n}/{len(docs)}] {src.name}")
+            pdf_engine = engines.get(src, "pymupdf")
+            results.append(converters.convert(
+                src, args.out, input_root, pdf_engine=pdf_engine,
+                skip_existing=args.skip_existing, log=_log,
+            ))
 
     ok = sum(1 for r in results if r["ok"])
     print(f"\nLote completo: {ok} OK, {len(results)-ok} con error.")

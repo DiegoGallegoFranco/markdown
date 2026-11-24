@@ -29,16 +29,24 @@
     {% for e in job.summary.errores %}<br><code>{{ e.documento }}</code> — {{ e.error }}{% endfor %}
   </p>
   {% endif %}
+  {% if job.summary.captions_error %}
+  <p class="nota">
+    AVISO: el captioning falló y se omitió; el ZIP contiene la conversión sin
+    (todas las) descripciones de imágenes.<br><code>{{ job.summary.captions_error }}</code>
+  </p>
+  {% endif %}
   {% endif %}
 
   {% if job.status == "done" %}
     <a class="btn" href="/jobs/{{ job.id }}/download">Descargar ZIP</a>
   {% endif %}
   <a class="btn btn-ghost" href="/jobs/{{ job.id }}/log">Log completo</a>
+  {% if job.status != "running" %}
   <form method="post" action="/jobs/{{ job.id }}/delete" style="display:inline"
         onsubmit="return confirm('Esto borra los documentos subidos y el resultado. ¿Continuar?')">
     <button type="submit" class="btn btn-ghost">Borrar</button>
   </form>
+  {% endif %}
 </div>
 
 <h2>Registro</h2>
