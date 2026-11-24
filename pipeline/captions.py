@@ -12,6 +12,10 @@ Es REANUDABLE: antes de llamar al modelo se detecta qué imágenes ya tienen
 caption y se saltan. Volver a ejecutarlo tras un fallo a mitad de lote no
 repite trabajo ni duplica descripciones.
 
+Evita llamadas inútiles al modelo: las imágenes con bytes idénticos (el logo
+de cada página) se describen una sola vez, las diminutas (iconos, viñetas,
+filetes) se omiten, y las grandes se reducen en memoria antes de enviarlas.
+
 Dos backends, misma interfaz (CAPTION_BACKEND):
 
     ollama     (default) modelo local vía Ollama. Las imágenes NO salen de la
@@ -23,6 +27,7 @@ from __future__ import annotations
 
 import base64
 import concurrent.futures
+import hashlib
 import json
 import os
 import threading
@@ -61,11 +66,23 @@ DEFAULT_MODELS = {
 DEFAULT_MODEL = os.environ.get("CAPTION_MODEL") or DEFAULT_MODELS.get(
     CAPTION_BACKEND, DEFAULT_MODELS[BACKEND_OLLAMA])
 
-# Ollama serializa las peticiones por defecto: lanzar 8 hilos contra un modelo
-# de 30B no acelera nada y puede agotar la VRAM. La API de Claude sí paraleliza.
+# Ollama serializa las peticiones por defecto: más hilos contra un modelo de
+# 30B no aceleran nada y pueden agotar la VRAM (mismo valor que docker-compose).
+# La API de Claude sí paraleliza.
 DEFAULT_WORKERS = int(os.environ.get(
-    "CAPTION_WORKERS", "2" if CAPTION_BACKEND == BACKEND_OLLAMA else "8"))
+    "CAPTION_WORKERS", "1" if CAPTION_BACKEND == BACKEND_OLLAMA else "8"))
 DEFAULT_MAX_RETRIES = int(os.environ.get("CAPTION_MAX_RETRIES", "6"))
+
+# Umbral de "imagen diminuta", sobre el LADO MENOR en píxeles. Se usa el lado
+# menor y no el área porque así caen tanto los iconos/viñetas (16x16, 32x32)
+# como las líneas separadoras y filetes (800x3), que tienen área grande pero
+# ningún contenido que describir. 0 desactiva el filtro.
+CAPTION_MIN_PX = int(os.environ.get("CAPTION_MIN_PX", "64"))
+# Lado mayor máximo de lo que se ENVÍA al modelo. El coste y el tiempo de un VLM
+# crecen con la resolución, y para una descripción de 1-2 frases 1024 px sobra.
+# Se reduce solo en memoria: el archivo en disco es el que enlaza el .md y no
+# se toca. 0 desactiva la reducción.
+CAPTION_MAX_PX = int(os.environ.get("CAPTION_MAX_PX", "1024"))
 
 PROMPT = (
     "Describe brevemente el contenido de esta imagen en español, en 1-2 "
@@ -111,23 +128,130 @@ def md_files_for(img_path: Path) -> list[Path]:
     return sorted(doc_dir.glob("*.md"))
 
 
-def pending_images(output_dir: Path, limit=None) -> tuple[list[Path], int]:
-    """Imágenes que aún no tienen caption. Devuelve (pendientes, total_encontradas)."""
+# --------------------------------------------------------------------------- imágenes: tamaño y preparación
+
+# Decisión sobre las imágenes DIMINUTAS (lado menor < CAPTION_MIN_PX):
+# no se describen y tampoco se escribe nada en el .md; simplemente NO cuentan
+# como pendientes (ni aquí, ni en audit(), ni en `captions-audit`).
+#   - No se describen: un icono o una viñeta no aporta nada buscable y cada
+#     llamada a un VLM local cuesta decenas de segundos.
+#   - No se marca en el .md (p. ej. "[imagen decorativa]"): ese texto acabaría
+#     troceado dentro de los chunks del RAG como ruido, repetido en cada página.
+#   - Se excluyen por definición en vez de persistir un estado: la condición se
+#     recalcula cada vez desde el propio archivo, así que si se baja el umbral
+#     reaparecen como pendientes sin migrar nada, y la auditoría no se llena de
+#     "faltantes" que nunca se van a resolver.
+# Si el tamaño no se puede leer (formato que pymupdf no decodifica, p. ej.
+# webp), la imagen NO se considera diminuta: ante la duda, se describe.
+
+def _pymupdf():
+    # Import perezoso: este módulo lo importa la web solo para consultar el
+    # estado del backend, y no necesita cargar MuPDF para eso.
+    import pymupdf
+    return pymupdf
+
+
+def image_size(img_path: Path) -> tuple[int, int] | None:
+    """(ancho, alto) en píxeles, o None si pymupdf no sabe decodificarla."""
+    try:
+        pix = _pymupdf().Pixmap(str(img_path))
+        return pix.width, pix.height
+    except Exception:
+        return None
+
+
+def is_tiny(img_path: Path, min_px=None) -> bool:
+    min_px = CAPTION_MIN_PX if min_px is None else min_px
+    if min_px <= 0:
+        return False
+    size = image_size(img_path)
+    return size is not None and min(size) < min_px
+
+
+def _sniff_media_type(data: bytes) -> str | None:
+    """Formato REAL de los bytes, por su firma.
+
+    La extensión no es fiable (un .png que en realidad es JPEG pasa al extraer
+    de algunos docx) y Anthropic rechaza la imagen si el media_type declarado no
+    coincide con el contenido.
+    """
+    if data.startswith(b"\x89PNG\r\n\x1a\n"):
+        return "image/png"
+    if data.startswith(b"\xff\xd8\xff"):
+        return "image/jpeg"
+    if data[:6] in (b"GIF87a", b"GIF89a"):
+        return "image/gif"
+    if data[:4] == b"RIFF" and data[8:12] == b"WEBP":
+        return "image/webp"
+    return None
+
+
+def prepare_image(img_path: Path, max_px=None) -> tuple[bytes, str]:
+    """(bytes, media_type) listos para enviar al modelo.
+
+    Reduce en memoria a `max_px` de lado mayor si hace falta, y transcodifica a
+    PNG lo que no sea un formato aceptado. Nunca escribe en disco. Si pymupdf
+    no puede decodificar la imagen (webp, formatos raros), se envía el original
+    tal cual: mejor una llamada más cara que una imagen sin describir.
+    """
+    max_px = CAPTION_MAX_PX if max_px is None else max_px
+    raw = Path(img_path).read_bytes()
+    media = _sniff_media_type(raw)
+    fallback = (raw, media or MEDIA_TYPES.get(Path(img_path).suffix.lower(), "image/png"))
+    try:
+        pymupdf = _pymupdf()
+        pix = pymupdf.Pixmap(raw)
+        grande = max_px > 0 and max(pix.width, pix.height) > max_px
+        if media is not None and not grande:
+            return raw, media  # sin cambios: se ahorra recomprimir
+        # PNG/JPEG solo admiten gris o RGB (p. ej. JPEG CMYK de imprenta).
+        if pix.colorspace is None or pix.colorspace.n not in (1, 3):
+            pix = pymupdf.Pixmap(pymupdf.csRGB, pix)
+        if grande:
+            f = max_px / max(pix.width, pix.height)
+            pix = pymupdf.Pixmap(pix, max(1, round(pix.width * f)),
+                                 max(1, round(pix.height * f)), None)
+        # Las fotos siguen en JPEG (en PNG pesarían varias veces más); el resto
+        # —diagramas, capturas, cualquier cosa con transparencia— va en PNG.
+        if media == "image/jpeg" and not pix.alpha:
+            return pix.tobytes("jpg", jpg_quality=90), "image/jpeg"
+        return pix.tobytes("png"), "image/png"
+    except Exception:
+        return fallback
+
+
+def _content_hash(img_path: Path) -> str:
+    return hashlib.sha256(Path(img_path).read_bytes()).hexdigest()
+
+
+def _scan(output_dir: Path, min_px=None) -> tuple[list[Path], list[Path], int]:
+    """(pendientes, diminutas_omitidas, total_encontradas)."""
     output_dir = Path(output_dir)
     todas = sorted(p for p in output_dir.rglob("*") if p.is_file() and p.suffix.lower() in IMG_EXTS)
     cache: dict[Path, dict[str, bool]] = {}
-    pendientes = []
+    pendientes, pequenas = [], []
     for img in todas:
         for md in md_files_for(img):
             estado = cache.get(md)
             if estado is None:
                 estado = cache[md] = caption_state(md)
             if estado.get(img.name) is False:  # referenciada y sin caption
-                pendientes.append(img)
+                # El tamaño se mira solo aquí, sobre las ya candidatas: decodificar
+                # cada imagen del árbol en cada auditoría sería trabajo inútil.
+                (pequenas if is_tiny(img, min_px) else pendientes).append(img)
                 break
+    return pendientes, pequenas, len(todas)
+
+
+def pending_images(output_dir: Path, limit=None, min_px=None) -> tuple[list[Path], int]:
+    """Imágenes que aún no tienen caption. Devuelve (pendientes, total_encontradas).
+
+    Las diminutas (ver CAPTION_MIN_PX) no cuentan como pendientes.
+    """
+    pendientes, _, total = _scan(output_dir, min_px)
     if limit:
         pendientes = pendientes[:limit]
-    return pendientes, len(todas)
+    return pendientes, total
 
 
 # --------------------------------------------------------------------------- escritura
@@ -215,7 +339,8 @@ def check_ollama(model=DEFAULT_MODEL, host=None) -> None:
 
 
 def _caption_ollama(img_path: Path, model=DEFAULT_MODEL, host=None) -> str:
-    data = base64.standard_b64encode(img_path.read_bytes()).decode("utf-8")
+    raw, _ = prepare_image(img_path)
+    data = base64.standard_b64encode(raw).decode("utf-8")
     body = _ollama_post("/api/chat", {
         "model": model,
         "stream": False,
@@ -231,8 +356,9 @@ def _caption_ollama(img_path: Path, model=DEFAULT_MODEL, host=None) -> str:
 # --------------------------------------------------------------------------- backend: Anthropic
 
 def _caption_anthropic(client, img_path: Path, model=DEFAULT_MODEL) -> str:
-    data = base64.standard_b64encode(img_path.read_bytes()).decode("utf-8")
-    media_type = MEDIA_TYPES[img_path.suffix.lower()]
+    # media_type sale de los bytes que se envían, no de la extensión del archivo.
+    raw, media_type = prepare_image(img_path)
+    data = base64.standard_b64encode(raw).decode("utf-8")
     resp = client.messages.create(
         model=model,
         max_tokens=200,
@@ -288,10 +414,30 @@ def backend_disponible(backend=None) -> tuple[bool, str]:
     return True, f"Ollama local ({DEFAULT_MODEL})"
 
 
+def _group_by_content(images: list[Path]) -> list[list[Path]]:
+    """Agrupa por sha256 del contenido, conservando el orden de aparición.
+
+    Un logo repetido en cada página se extrae como N archivos idénticos con
+    nombres distintos; describirlo N veces es pagar N llamadas por la misma
+    respuesta. Si un archivo no se puede leer va solo en su grupo: el error
+    saldrá al procesarlo, sin arrastrar a otras imágenes.
+    """
+    grupos: dict[str, list[Path]] = {}
+    for img in images:
+        try:
+            clave = _content_hash(img)
+        except OSError:
+            clave = f"ilegible:{img}"
+        grupos.setdefault(clave, []).append(img)
+    return list(grupos.values())
+
+
 def run(output_dir, model=DEFAULT_MODEL, workers=DEFAULT_WORKERS, limit=None,
-        images=None, log=None, dry_run=False, backend=None, host=None) -> dict:
+        images=None, log=None, dry_run=False, backend=None, host=None,
+        min_px=None) -> dict:
     """Genera e inserta captions. Devuelve un resumen con contadores."""
     backend = (backend or CAPTION_BACKEND).lower()
+    min_px = CAPTION_MIN_PX if min_px is None else min_px
 
     def _log(msg):
         if log:
@@ -299,16 +445,29 @@ def run(output_dir, model=DEFAULT_MODEL, workers=DEFAULT_WORKERS, limit=None,
 
     output_dir = Path(output_dir)
     if images is None:
-        images, total = pending_images(output_dir, limit=limit)
+        images, pequenas, total = _scan(output_dir, min_px)
+        if limit:
+            images = images[:limit]
     else:
         images = [Path(p) for p in images]
         total = len(images)
+        tiny = {p: is_tiny(p, min_px) for p in images}
+        pequenas = [p for p in images if tiny[p]]
+        images = [p for p in images if not tiny[p]]
 
+    grupos = _group_by_content(images)
     _log(f"Imágenes sin caption: {len(images)} (de {total} encontradas) "
+         f"| llamadas al modelo: {len(grupos)} "
          f"| backend: {backend} | modelo: {model}")
+    if len(grupos) < len(images):
+        _log(f"Duplicadas por contenido: {len(images) - len(grupos)} imágenes "
+             f"reutilizarán la descripción de una idéntica")
+    if pequenas:
+        _log(f"Omitidas por diminutas (lado menor < {min_px} px): {len(pequenas)}")
     resumen = {"pendientes": len(images), "total": total, "ok": 0, "errores": 0,
                "sin_referencia": 0, "duracion_s": 0.0, "modelo": model,
-               "backend": backend}
+               "backend": backend, "llamadas": len(grupos), "reutilizadas": 0,
+               "omitidas_pequenas": len(pequenas)}
     if dry_run or not images:
         return resumen
 
@@ -326,35 +485,56 @@ def run(output_dir, model=DEFAULT_MODEL, workers=DEFAULT_WORKERS, limit=None,
     contador = threading.Lock()
     hechas = 0
 
-    def process(img_path: Path):
+    def process(grupo: list[Path]):
         nonlocal hechas
+        rep = grupo[0]
         try:
-            caption = caption_image(img_path, model=model, backend=backend,
+            caption = caption_image(rep, model=model, backend=backend,
                                     client=client, host=host)
-            inserted = any(insert_caption(md, img_path.name, caption) for md in md_files_for(img_path))
-            with contador:
-                hechas += 1
-                if inserted:
-                    resumen["ok"] += 1
-                else:
-                    resumen["sin_referencia"] += 1
-                _log(f"[{hechas}/{len(images)}] {'OK' if inserted else 'sin referencia en .md'}: "
-                     f"{img_path.name} -> {caption[:80]}")
         except Exception as e:
             # Un fallo por imagen no aborta el lote: se registra y se sigue.
             # Reintentar el lote después es barato — lo ya hecho se salta solo.
             with contador:
+                hechas += len(grupo)
+                resumen["errores"] += len(grupo)
+                extra = f" (y {len(grupo) - 1} idénticas)" if len(grupo) > 1 else ""
+                _log(f"[ERROR] {rep.name}{extra}: {type(e).__name__}: {e}")
+            return
+        # La misma descripción para todas las copias. insert_caption toma el
+        # lock de cada .md, así que esto es seguro aunque otro hilo esté
+        # escribiendo en el mismo documento.
+        for img in grupo:
+            reutilizada = img is not rep
+            try:
+                inserted = any(insert_caption(md, img.name, caption) for md in md_files_for(img))
+                fallo = None
+            except Exception as e:
+                inserted, fallo = False, e
+            with contador:
                 hechas += 1
-                resumen["errores"] += 1
-                _log(f"[ERROR] {img_path.name}: {type(e).__name__}: {e}")
+                if fallo is not None:
+                    resumen["errores"] += 1
+                    _log(f"[ERROR] {img.name}: {type(fallo).__name__}: {fallo}")
+                    continue
+                if inserted:
+                    resumen["ok"] += 1
+                    if reutilizada:
+                        resumen["reutilizadas"] += 1
+                else:
+                    resumen["sin_referencia"] += 1
+                estado = "OK" if inserted else "sin referencia en .md"
+                origen = f" (reutilizada de {rep.name})" if reutilizada else ""
+                _log(f"[{hechas}/{len(images)}] {estado}: {img.name}{origen} -> {caption[:80]}")
 
     started = time.time()
-    with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as ex:
-        list(ex.map(process, images))
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, workers)) as ex:
+        list(ex.map(process, grupos))
     resumen["duracion_s"] = round(time.time() - started, 1)
 
     _log(f"Captions completados en {resumen['duracion_s']/60:.1f} min. "
-         f"OK: {resumen['ok']} | sin referencia: {resumen['sin_referencia']} | errores: {resumen['errores']}")
+         f"OK: {resumen['ok']} (reutilizadas: {resumen['reutilizadas']}) "
+         f"| llamadas: {resumen['llamadas']} | sin referencia: {resumen['sin_referencia']} "
+         f"| omitidas diminutas: {resumen['omitidas_pequenas']} | errores: {resumen['errores']}")
     return resumen
 
 

@@ -63,8 +63,14 @@ def reference_pattern(img_name: str) -> re.Pattern:
     del HTML, que puede estar líneas más abajo).
     """
     esc = re.escape(img_name)
+    # El nombre tiene que ser el componente COMPLETO de la ruta: precedido por
+    # el inicio de la ruta o por `/`, y seguido del cierre (`)`, `>`, espacio
+    # del título, comilla) o de `?`/`#`. Con un prefijo libre (`[^)]*` + nombre)
+    # el patrón de `a.png` casaba con `assets/ba.png`: el caption iba a la
+    # imagen equivocada y, como `a.png` seguía "pendiente", cada ejecución
+    # añadía otro duplicado.
     return re.compile(
-        r'(!\[[^\]]*\]\([^)]*' + esc + r'[^)]*\))'
-        r'|(<img\b[^>]*?\bsrc\s*=\s*["\'][^"\']*' + esc + r'["\'][^>]*>)',
+        r'(!\[[^\]]*\]\(\s*<?(?:[^)\s>]*/)?' + esc + r'(?=[)>\s?#])[^)]*\))'
+        r'|(<img\b[^>]*?\bsrc\s*=\s*["\'](?:[^"\']*/)?' + esc + r'(?=["\'?#])[^"\']*["\'][^>]*>)',
         re.IGNORECASE | re.DOTALL,
     )
