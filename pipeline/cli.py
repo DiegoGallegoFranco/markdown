@@ -16,7 +16,7 @@ import sys
 from pathlib import Path
 
 from . import captions as captions_mod
-from . import converters, inventory, qc
+from . import converters, indice, inventory, qc
 from .paths import PDF_EXTS, collect_documents, common_root
 
 
@@ -96,13 +96,26 @@ def cmd_captions(args) -> int:
     imgs = None
     if args.from_file:
         imgs = [Path(l.strip()) for l in Path(args.from_file).read_text().splitlines() if l.strip()]
+    if getattr(args, "rehacer", False) or getattr(args, "rehacer_todo", False):
+        r = captions_mod.quitar_descripciones(args.output, solo_breves=not args.rehacer_todo, log=_log)
+        _log(f"Quitadas {r['quitadas']} descripciones en {r['archivos_modificados']} archivo(s); "
+             f"se vuelven a generar ahora.")
     try:
         captions_mod.run(args.output, model=args.model, workers=args.workers,
                          limit=args.limit, images=imgs, log=_log, dry_run=args.dry_run,
-                         backend=args.backend, host=args.ollama_host)
+                         backend=args.backend, host=args.ollama_host,
+                         modo=getattr(args, "modo", None))
     except (RuntimeError, captions_mod.OllamaError) as e:
         print(f"ERROR: {e}", file=sys.stderr)
         return 1
+    return 0
+
+
+def cmd_indice_imagenes(args) -> int:
+    r = indice.construir(args.output)
+    print(f"Índice: {r['imagenes']} imágenes de {r['documentos']} documento(s)")
+    for ruta in r["rutas"]:
+        print(f"  {ruta}")
     return 0
 
 
@@ -153,7 +166,7 @@ def cmd_todo(args) -> int:
         print("\n=== Captioning de imágenes ===")
         cmd_captions(argparse.Namespace(
             output=args.out, model=args.model, workers=args.workers,
-            limit=None, from_file=None, dry_run=False,
+            limit=None, from_file=None, dry_run=False, modo=args.modo,
             backend=captions_mod.CAPTION_BACKEND, ollama_host=captions_mod.OLLAMA_HOST,
         ))
     print("\n=== Control de calidad ===")
@@ -185,7 +198,7 @@ def build_parser() -> argparse.ArgumentParser:
     add_convert_args(sp)
     sp.set_defaults(func=cmd_convertir)
 
-    sp = sub.add_parser("captions", help="Describir imágenes con la API de Claude")
+    sp = sub.add_parser("captions", help="Describir/extraer el contenido de las imágenes")
     sp.add_argument("--output", default="output")
     sp.add_argument("--model", default=captions_mod.DEFAULT_MODEL)
     sp.add_argument("--workers", type=int, default=captions_mod.DEFAULT_WORKERS)
@@ -196,7 +209,17 @@ def build_parser() -> argparse.ArgumentParser:
                     default=captions_mod.CAPTION_BACKEND,
                     help="ollama = local, nada sale de la máquina (default)")
     sp.add_argument("--ollama-host", default=captions_mod.OLLAMA_HOST)
+    sp.add_argument("--modo", choices=["detallado", "breve"], default=captions_mod.CAPTION_MODE,
+                    help="detallado = extrae tablas/texto/relaciones + índice (default)")
+    sp.add_argument("--rehacer", action="store_true",
+                    help="Quitar las descripciones BREVES existentes y extraerlas de nuevo")
+    sp.add_argument("--rehacer-todo", action="store_true",
+                    help="Quitar TODAS las descripciones (breves y detalladas) y regenerarlas")
     sp.set_defaults(func=cmd_captions)
+
+    sp = sub.add_parser("indice-imagenes", help="Regenerar el índice global de imágenes")
+    sp.add_argument("--output", default="output")
+    sp.set_defaults(func=cmd_indice_imagenes)
 
     sp = sub.add_parser("captions-audit", help="Listar imágenes sin caption")
     sp.add_argument("--output", default="output")
@@ -214,6 +237,7 @@ def build_parser() -> argparse.ArgumentParser:
     sp = sub.add_parser("todo", help="Pipeline completo de principio a fin")
     add_convert_args(sp)
     sp.add_argument("--captions", action="store_true", help="Incluir el paso de captioning")
+    sp.add_argument("--modo", choices=["detallado", "breve"], default=captions_mod.CAPTION_MODE)
     sp.add_argument("--model", default=captions_mod.DEFAULT_MODEL)
     sp.add_argument("--workers", type=int, default=captions_mod.DEFAULT_WORKERS)
     sp.set_defaults(func=cmd_todo)

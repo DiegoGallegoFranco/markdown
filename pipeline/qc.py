@@ -11,9 +11,11 @@ from __future__ import annotations
 import csv
 from pathlib import Path
 
-from .mdimages import local_image_refs, resolve
+from .mdimages import MARKER_BREVE, contar_descripciones, local_image_refs, resolve
 
-CAPTION_MARKER = "*[descripción generada por IA:"
+CAPTION_MARKER = MARKER_BREVE  # compatibilidad
+# Generado por el índice de imágenes, no es un documento convertido.
+NO_DOCUMENTOS = {"INDICE_IMAGENES.md"}
 
 FIELDNAMES = [
     "ruta_md", "duracion_min", "chars", "encabezados", "imagenes",
@@ -29,7 +31,8 @@ def check_md(md: Path, root: Path, duracion_s=None) -> dict:
     # forma para imágenes con atributos, y sin ella los docx daban 0 imágenes.
     refs = local_image_refs(text)
     broken = [r for r in refs if not resolve(md, r).exists()]
-    n_captions = text.count(CAPTION_MARKER)
+    # Ambos formatos: la línea breve y el bloque detallado (ver mdimages).
+    n_captions = contar_descripciones(text)
 
     if n_chars == 0:
         estado = "ERROR: vacío"
@@ -66,7 +69,7 @@ def run(output_dir, root=None, durations=None) -> list[dict]:
     durations = durations or {}
     return [
         check_md(md, root, durations.get(md.stem))
-        for md in sorted(output_dir.rglob("*.md"))
+        for md in sorted(output_dir.rglob("*.md")) if md.name not in NO_DOCUMENTOS
     ]
 
 

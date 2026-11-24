@@ -70,6 +70,9 @@ def sentinel_aislado(tmp_path, monkeypatch):
     monkeypatch.setattr(converters, "_SURYA_LLAMA_SENTINEL", sentinel)
     monkeypatch.setattr(converters, "_session_depth", 0)
     monkeypatch.setattr(converters, "_session_preexisting", False)
+    # Caché de extracciones de imágenes: nunca la real (~/.cache o DATA_DIR).
+    from pipeline import captions
+    monkeypatch.setattr(captions, "CAPTION_CACHE_DIR", tmp_path / "caption-cache")
     yield sentinel
 
 

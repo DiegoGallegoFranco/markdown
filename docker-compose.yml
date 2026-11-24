@@ -51,8 +51,14 @@ services:
       OLLAMA_TIMEOUT_S: "${OLLAMA_TIMEOUT_S:-300}"
       # Ollama serializa: más hilos no aceleran y pueden agotar la VRAM.
       CAPTION_WORKERS: "${CAPTION_WORKERS:-1}"
+      # detallado = extrae tablas/texto/relaciones e indexa las imágenes;
+      # breve = descripción de 1-2 frases.
+      CAPTION_MODE: "${CAPTION_MODE:-detallado}"
       CAPTION_MIN_PX: "${CAPTION_MIN_PX:-64}"
-      CAPTION_MAX_PX: "${CAPTION_MAX_PX:-1024}"
+      # Vacío = según el modo (1600 detallado, 1024 breve).
+      CAPTION_MAX_PX: "${CAPTION_MAX_PX:-}"
+      CAPTION_NUM_PREDICT: "${CAPTION_NUM_PREDICT:-2048}"
+      CAPTION_NUM_CTX: "${CAPTION_NUM_CTX:-8192}"
       # Solo si CAPTION_BACKEND=anthropic (las imágenes saldrían a un tercero).
       ANTHROPIC_API_KEY: "${ANTHROPIC_API_KEY:-}"
     # Hace que host.docker.internal apunte al host también en Linux, donde

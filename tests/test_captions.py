@@ -25,6 +25,8 @@ def modelo(monkeypatch):
     media_type REAL de lo que se le envió."""
     monkeypatch.setattr(C, "CAPTION_MIN_PX", 64)
     monkeypatch.setattr(C, "CAPTION_MAX_PX", 1024)
+    # Estos tests cubren el modo BREVE; el detallado está en test_extraccion.py.
+    monkeypatch.setattr(C, "CAPTION_MODE", C.MODO_BREVE)
     llamadas = []
     lock = threading.Lock()
 

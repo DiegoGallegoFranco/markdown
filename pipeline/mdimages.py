@@ -28,6 +28,32 @@ ANY_IMG_RE = re.compile(
 )
 
 
+# --------------------------------------------------------------------------- bloques generados por IA
+#
+# Dos formatos conviven en los .md (los antiguos no se reescriben solos):
+#   breve      `*[descripción generada por IA: ...]*` — una línea.
+#   detallado  bloque de cita que empieza por `> **Imagen N · Tipo**` y cuya
+#              segunda línea es `> *Contenido extraído por IA · id: ...*`.
+# El bloque detallado es UN solo párrafo (todas sus líneas empiezan por `>`,
+# sin líneas en blanco), así que partir el .md por "\n\n" lo deja entero.
+MARKER_BREVE = "*[descripción generada por IA:"
+BLOQUE_INICIO = "> **Imagen "
+BLOQUE_SELLO = "\n> *Contenido extraído por IA"
+
+
+def es_descripcion_ia(parrafo: str) -> bool:
+    s = parrafo.lstrip()
+    return s.startswith(MARKER_BREVE) or (s.startswith(BLOQUE_INICIO) and BLOQUE_SELLO in s)
+
+
+def es_descripcion_breve(parrafo: str) -> bool:
+    return parrafo.lstrip().startswith(MARKER_BREVE)
+
+
+def contar_descripciones(text: str) -> int:
+    return sum(1 for p in text.split("\n\n") if es_descripcion_ia(p))
+
+
 def is_external(ref: str) -> bool:
     return urlparse(ref).scheme in ("http", "https", "data")
 

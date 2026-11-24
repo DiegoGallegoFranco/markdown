@@ -175,7 +175,10 @@ sobreviven a un reinicio del servicio (se reanudan donde estaban).
 | `CAPTION_WORKERS` | `1` (ollama) | Ollama atiende de a una; subirlo no acelera |
 | `OLLAMA_TIMEOUT_S` | `300` | Un 30B tarda decenas de segundos por imagen |
 | `CAPTION_MIN_PX` | `64` | Imágenes con el lado menor por debajo (iconos, filetes) no se describen. `0` = describir todo |
-| `CAPTION_MAX_PX` | `1024` | Se reduce en memoria a este lado máximo antes de enviarla al modelo (el archivo no cambia). `0` = sin reducir |
+| `CAPTION_MAX_PX` | `1600` detallado / `1024` breve | Se reduce en memoria a este lado máximo antes de enviarla al modelo (el archivo no cambia). `0` = sin reducir |
+| `CAPTION_MODE` | `detallado` | `detallado` extrae el contenido de cada imagen y genera el índice; `breve` = 1-2 frases |
+| `CAPTION_NUM_PREDICT` / `CAPTION_NUM_CTX` | `2048` / `8192` | Tope de respuesta y ventana de contexto del modelo en modo detallado |
+| `CAPTION_CACHE_DIR` | `$DATA_DIR/caption-cache` | Caché de extracciones por contenido; vacío la desactiva |
 
 > **La app no tiene autenticación.** Cualquiera que alcance el puerto puede
 > subir documentos, ver los de los demás y borrarlos. Por eso el
@@ -358,6 +361,63 @@ Las imágenes se extraen como archivos separados con enlaces relativos
   eso) es responsabilidad del consumidor en el momento de la llamada.
 
 ### Captioning de imágenes
+
+#### Modo detallado (por defecto): extraer la información de la imagen
+
+Una descripción de 1-2 frases hace una imagen *encontrable*, pero pierde sus
+**datos**: si una cifra solo existe en una tabla pegada como imagen, el banco
+de conocimiento no puede responder sobre ella. En modo `detallado` el modelo
+identifica el tipo de imagen y extrae lo que corresponde, en una sola llamada
+con salida JSON validada por esquema:
+
+| Tipo | Qué se extrae |
+|---|---|
+| Tabla | La tabla completa en Markdown, con todas sus cifras |
+| Gráfica | Tipo, ejes, series y valores (≈ si son estimados), tendencia |
+| Diagrama / organigrama / flujo | Elementos y relaciones `A → B` |
+| Texto / formulario / captura | Transcripción literal |
+| Mapa / plano | Lugares, rótulos, leyenda, escala |
+| Foto | Descripción y texto visible |
+| Logo / decorativa | Solo se marca (bloque mínimo) |
+
+Al modelo se le envía también el **contexto** de la imagen en el documento
+(sección, pie de figura, párrafo anterior), que le permite titularla y
+entenderla. Bajo cada imagen queda un bloque así, que el RAG trocea junto con
+su sección:
+
+```markdown
+> **Imagen 3 · Tabla** — Presupuesto por dependencia 2025
+> *Contenido extraído por IA · id: informe/img-003 · página 2 · sección: 3. Finanzas > 3.2 Presupuesto*
+>
+> | Dependencia | 2024 | 2025 |
+> |---|---|---|
+> | Logística | 1.250 | 1.410 |
+>
+> **Palabras clave:** presupuesto, dependencias, 2025
+> **Entidades:** Logística
+```
+
+**Índice de imágenes.** Cada documento lleva un `imagenes.json` (id, página,
+sección, tipo, título, resumen, contenido, palabras clave, entidades) y en la
+raíz de la salida se generan `INDICE_IMAGENES.md` (agrupado por tipo, con
+enlaces), `indice_imagenes.csv` (para filtrar en una hoja de cálculo) e
+`indice_imagenes.json` (para cargarlo en otro sistema). Se regenera con
+`python -m pipeline indice-imagenes --output DIR`.
+
+**Eficiencia.** Además de la deduplicación y el filtro de diminutas: caché
+persistente por contenido (una imagen ya extraída en otro trabajo no vuelve al
+modelo), y los logos/decorativas apenas generan texto. Aun así cada imagen
+informativa tarda más que en modo breve: la respuesta es mucho más larga.
+
+**Pasar documentos ya descritos al modo detallado** sin reconvertirlos:
+`python -m pipeline captions --output DIR --rehacer` (quita las descripciones
+breves y extrae de nuevo; `--rehacer-todo` regenera también las detalladas).
+
+> Es contenido generado por un modelo: puede leer mal una cifra. Por eso cada
+> bloque va marcado como extraído por IA y lleva `calidad: baja` cuando la
+> imagen es poco legible. Para cifras críticas, verificar contra el original.
+
+#### Backends
 
 Para que el contenido de diagramas/mapas/tablas-como-imagen sea *buscable por
 texto* (un RAG de solo texto no puede "ver" una imagen), se genera una vez una
