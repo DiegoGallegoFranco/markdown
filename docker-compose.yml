@@ -6,9 +6,13 @@ services:
       context: .
       args:
         WITH_MARKER: "${WITH_MARKER:-true}"   # "false" para la imagen ligera sin OCR
-        # "true" compila llama-server: necesario para el modo `balanced` de
-        # Marker, que es el que usa la GPU y da la mejor calidad.
+        # "true" compila llama-server CON CUDA: necesario para el modo
+        # `balanced` de Marker, que es el que usa la GPU y da la mejor calidad.
         WITH_LLAMA_SERVER: "${WITH_LLAMA_SERVER:-false}"
+        # Arquitectura CUDA del servidor de destino, solo se usa si
+        # WITH_LLAMA_SERVER=true. 75 = Turing (Quadro RTX 8000, RTX 20xx, T4);
+        # 80 = A100; 86 = RTX 30xx/A6000; 89 = RTX 40xx/L4.
+        CUDA_ARCHITECTURES: "${CUDA_ARCHITECTURES:-75}"
     image: doc2md:latest
     restart: unless-stopped
     # La app no tiene autenticación: se publica solo en la interfaz de loopback
@@ -24,8 +28,18 @@ services:
       # "balanced" a mano requiere el binario llama-server en la imagen.
       MARKER_MODE: "${MARKER_MODE:-}"
       MARKER_TIMEOUT_S: "${MARKER_TIMEOUT_S:-14400}"
+      # Modo auto: cuándo un PDF nativo con páginas escaneadas va a Marker.
+      DOC2MD_MIXTO_MIN_PAGINAS: "${DOC2MD_MIXTO_MIN_PAGINAS:-2}"
+      DOC2MD_MIXTO_MIN_RATIO: "${DOC2MD_MIXTO_MIN_RATIO:-0.10}"
+      DOC2MD_COBERTURA_ESCANEO: "${DOC2MD_COBERTURA_ESCANEO:-0.5}"
       MAX_UPLOAD_MB: "${MAX_UPLOAD_MB:-500}"
       RETENTION_DAYS: "${RETENTION_DAYS:-14}"
+      # Cada cuántas horas se borran los trabajos que pasaron RETENTION_DAYS.
+      PURGE_INTERVAL_H: "${PURGE_INTERVAL_H:-6}"
+      # Backend del VLM de Marker. Con GPU NVIDIA surya elegiría "vllm", que
+      # lanza `docker run` y dentro del contenedor no hay docker. El código ya
+      # fija llamacpp por defecto; se deja aquí visible por si hay que cambiarlo.
+      SURYA_INFERENCE_BACKEND: "${SURYA_INFERENCE_BACKEND:-llamacpp}"
       # Captioning de imágenes. Por defecto "ollama": el modelo corre en TU
       # servidor y las imágenes no salen de la máquina.
       CAPTION_BACKEND: "${CAPTION_BACKEND:-ollama}"
@@ -36,7 +50,9 @@ services:
       CAPTION_MODEL: "${CAPTION_MODEL:-qwen3-vl:32b}"
       OLLAMA_TIMEOUT_S: "${OLLAMA_TIMEOUT_S:-300}"
       # Ollama serializa: más hilos no aceleran y pueden agotar la VRAM.
-      CAPTION_WORKERS: "${CAPTION_WORKERS:-2}"
+      CAPTION_WORKERS: "${CAPTION_WORKERS:-1}"
+      CAPTION_MIN_PX: "${CAPTION_MIN_PX:-64}"
+      CAPTION_MAX_PX: "${CAPTION_MAX_PX:-1024}"
       # Solo si CAPTION_BACKEND=anthropic (las imágenes saldrían a un tercero).
       ANTHROPIC_API_KEY: "${ANTHROPIC_API_KEY:-}"
     # Hace que host.docker.internal apunte al host también en Linux, donde

@@ -28,9 +28,23 @@ Dos motores para PDF, con trade-offs distintos:
   Esto importa para la decisión de hardware: en un servidor **sin GPU no solo
   vas más lento, corres un modo distinto y de menor calidad**.
 
+  En modo `balanced`, el VLM corre en un `llama-server` aparte. Dentro de un
+  lote (CLI `convertir`/`todo` o un trabajo de la web) se arranca **una vez** y
+  los documentos siguientes lo reutilizan; al terminar el lote se apaga para
+  liberar la VRAM antes del captioning. Fuera de un lote, cada `marker_single`
+  arranca y apaga el suyo (comportamiento por defecto de surya).
+
 El **modo `auto`** (por defecto) hace la elección por documento: clasifica cada
-PDF con el inventario y manda a Marker solo los escaneados. Es lo que conviene
-en casi todos los casos.
+PDF con el inventario y manda a Marker los escaneados y los **mixtos** —
+mayormente nativos pero con páginas escaneadas (anexos, actas firmadas), que con
+pymupdf4llm saldrían vacías sin aviso. Es lo que conviene en casi todos los
+casos. El `inventario.csv` explica cada decisión en la columna `motivo`.
+
+| Variable | Default | Para qué |
+|---|---|---|
+| `DOC2MD_COBERTURA_ESCANEO` | `0.5` | Fracción de la página cubierta por imagen (sin texto) para considerarla escaneada |
+| `DOC2MD_MIXTO_MIN_PAGINAS` | `2` | Páginas escaneadas que bastan para mandar un PDF nativo a Marker. `1` = cero pérdidas, a costa de enviar documentos largos por una sola portada-imagen |
+| `DOC2MD_MIXTO_MIN_RATIO` | `0.10` | …o esta fracción de páginas escaneadas (decide en documentos cortos) |
 
 ## Arquitectura
 
@@ -94,7 +108,7 @@ python -m pipeline convertir "/ruta/doc1.pdf" "/ruta/doc2.pdf" --engine auto
 # Fase 3 — lote completo (acepta archivos o directorios, rutas absolutas)
 python -m pipeline convertir /ruta/a/documentos --engine auto --skip-existing
 
-# Descripción de imágenes (opcional, requiere ANTHROPIC_API_KEY)
+# Descripción de imágenes (opcional; por defecto Ollama local, sin clave)
 python -m pipeline captions --dry-run     # cuenta, no llama a la API
 python -m pipeline captions --limit 3     # smoke test
 python -m pipeline captions               # todo
@@ -151,13 +165,17 @@ sobreviven a un reinicio del servicio (se reanudan donde estaban).
 | `ANTHROPIC_API_KEY` | — | Habilita el paso opcional de captioning |
 | `MAX_UPLOAD_MB` | `500` | Tope por archivo |
 | `RETENTION_DAYS` | `14` | Borra trabajos terminados más antiguos (0 = nunca) |
+| `PURGE_INTERVAL_H` | `6` | Cada cuántas horas se aplica la retención (además de al arrancar) |
+| `SURYA_INFERENCE_BACKEND` | `llamacpp` | Backend del VLM de Marker. No usar `vllm` dentro del contenedor (lanza `docker run`) |
 | `MARKER_MODE` | *(vacío)* | Vacío = Marker elige por dispositivo. `fast` o `balanced` para forzarlo |
 | `MARKER_TIMEOUT_S` | `14400` | Corta un documento colgado en vez de bloquear el lote |
 | `CAPTION_BACKEND` | `ollama` | `ollama` (local, nada sale) o `anthropic` (API externa) |
 | `OLLAMA_HOST` | `http://localhost:11434` | En Docker: `http://host.docker.internal:11434` |
 | `CAPTION_MODEL` | `qwen3-vl:32b` | Modelo de visión (o `claude-sonnet-5` con backend anthropic) |
-| `CAPTION_WORKERS` | `2` (ollama) | Ollama atiende de a una; subirlo no acelera |
+| `CAPTION_WORKERS` | `1` (ollama) | Ollama atiende de a una; subirlo no acelera |
 | `OLLAMA_TIMEOUT_S` | `300` | Un 30B tarda decenas de segundos por imagen |
+| `CAPTION_MIN_PX` | `64` | Imágenes con el lado menor por debajo (iconos, filetes) no se describen. `0` = describir todo |
+| `CAPTION_MAX_PX` | `1024` | Se reduce en memoria a este lado máximo antes de enviarla al modelo (el archivo no cambia). `0` = sin reducir |
 
 > **La app no tiene autenticación.** Cualquiera que alcance el puerto puede
 > subir documentos, ver los de los demás y borrarlos. Por eso el
@@ -183,7 +201,7 @@ Configuración por `.env` junto al `docker-compose.yml`:
 ```env
 PORT=8000
 WORKERS=1
-# ANTHROPIC_API_KEY=sk-ant-...   # solo si quieres captioning de imágenes
+# ANTHROPIC_API_KEY=sk-ant-...   # solo con CAPTION_BACKEND=anthropic (las imágenes salen a un tercero)
 ```
 
 El servicio se publica en `127.0.0.1:8000` del host. Para llegar desde otra
@@ -209,6 +227,21 @@ docker compose exec app python -c "import torch; print(torch.cuda.is_available()
 
 Requiere el NVIDIA Container Toolkit en el host.
 
+> **Ojo si además usas `docker-compose.override.yml`** (por ejemplo para
+> conectar con un Ollama que corre en otro compose). Compose auto-carga el
+> override **solo cuando no pasas ningún `-f`**: el comando de arriba lo
+> descarta en silencio, y arrancar sin `-f` para conservarlo descarta el
+> fichero de GPU. Cuando quieras los dos, decláralo en `.env` y arranca sin
+> `-f`:
+>
+> ```bash
+> # .env
+> COMPOSE_FILE=docker-compose.yml:docker-compose.gpu.yml:docker-compose.override.yml
+> ```
+>
+> `docker compose config` imprime la configuración ya fusionada: si no aparece
+> `runtime: nvidia`, el contenedor está corriendo en CPU.
+
 **Para aprovechar la GPU de verdad hace falta el modo `balanced`**, y ese modo
 necesita el binario `llama-server`, que la imagen por defecto no trae:
 
@@ -216,9 +249,22 @@ necesita el binario `llama-server`, que la imagen por defecto no trae:
 docker build --build-arg WITH_MARKER=true --build-arg WITH_LLAMA_SERVER=true -t doc2md .
 ```
 
-Compila llama.cpp en una etapa aparte (solo el binario llega a la imagen
-final). Sin él, Marker corre en modo `fast` incluso con GPU presente, y forzar
-`MARKER_MODE=balanced` falla con `llama-server binary not found`.
+Compila llama.cpp en una etapa aparte (solo el binario y sus librerías CUDA
+llegan a la imagen final). Sin él, Marker corre en modo `fast` incluso con GPU
+presente, y forzar `MARKER_MODE=balanced` falla con `llama-server binary not
+found`.
+
+Ese `llama-server` se compila **con `-DGGML_CUDA=ON`**, para la arquitectura que
+indique `CUDA_ARCHITECTURES` (por defecto `75`, Turing: Quadro RTX 8000, RTX
+20xx, T4 — ajústalo a tu GPU, ver tabla en `.env.example`). Compilarlo sin CUDA
+deja la mitad del trabajo en CPU: la parte torch de Marker sí iría a la GPU,
+pero el VLM de layout, que es la etapa cara del modo `balanced`, se quedaría en
+CPU y el documento tardaría casi lo mismo.
+
+El build **falla a propósito** si `llama-server` no resuelve alguna librería
+(comprobación con `ldd`). Es el escenario que más fácil se cuela: en CPU Marker
+nunca invoca ese binario, así que un enlazado roto no da la cara hasta la
+primera conversión con GPU, meses después.
 
 ### CLI dentro del contenedor
 
@@ -377,6 +423,11 @@ que en Linux es necesario (en Mac y Windows Docker lo define solo).
   `ANTHROPIC_API_KEY` y `CAPTION_MODEL=claude-sonnet-5`. Mejor calidad y mucho
   más rápido, pero cada imagen viaja a un tercero — no usar con documentos
   sensibles.
+- **Llamadas evitadas**: las imágenes idénticas (un logo repetido en cada
+  página) se describen una sola vez por ejecución y comparten descripción; las
+  diminutas (`CAPTION_MIN_PX`) se omiten sin escribir nada en el `.md`; y las
+  grandes se reducen a `CAPTION_MAX_PX` antes de enviarlas, porque el tiempo de
+  un modelo de visión crece con la resolución.
 - **Cuidado con la concurrencia**: si varios hilos escriben el mismo `.md` sin
   lock hay *lost updates* (captions que desaparecen sin error visible).
   `pipeline/captions.py` usa un lock por archivo — no quitarlo.
